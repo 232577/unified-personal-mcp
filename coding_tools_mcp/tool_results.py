@@ -99,12 +99,18 @@ def _render_read_file(payload: dict[str, Any]) -> str:
     content = payload.get("content")
     if not isinstance(content, str):
         return ""
-    if not payload.get("truncated"):
-        return content
     shown = (
         f"Showing lines {payload.get('start_line', '?')}-{payload.get('end_line', '?')}"
         f" of {payload.get('total_lines', '?')}"
     )
+    # apply_changes requires the revision of the bytes the model actually read.
+    # Most clients forward only this text, so a revision that lived solely in
+    # structuredContent would be unreachable for the caller that needs it.
+    revision = payload.get("revision")
+    if isinstance(revision, str) and revision:
+        shown = f"{shown} revision={revision}"
+    if not payload.get("truncated"):
+        return f"[{shown}]\n{content}"
     next_start = payload.get("next_start_line")
     next_call = _render_next_action(payload)
     if not next_call and next_start:
@@ -169,15 +175,59 @@ def _render_search(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _render_patch(payload: dict[str, Any]) -> str:
-    prefix = "Patch validated" if payload.get("dry_run") else "Patch applied"
+def _render_changes(payload: dict[str, Any]) -> str:
+    return _render_patch(payload, noun="Changes")
+
+
+def _render_patch(payload: dict[str, Any], *, noun: str = "Patch") -> str:
+    prefix = f"{noun} validated" if payload.get("dry_run") else f"{noun} applied"
+    if payload.get("already_applied"):
+        prefix = f"{noun} already applied"
     files = payload.get("affected_files")
     count = len(files) if isinstance(files, list) else 0
     changes = f" (+{payload.get('additions', 0)} -{payload.get('removals', 0)})"
+    lines = [f"{prefix} to {count} file{'s' if count != 1 else ''}{changes}."]
     summary = str(payload.get("summary") or "").strip()
-    return f"{prefix} to {count} file{'s' if count != 1 else ''}{changes}." + (
-        f"\n{summary}" if summary else ""
-    )
+    if summary:
+        lines.append(summary)
+    # Post-edit evidence: the model asked for a change and gets back what the
+    # file now is, including the revision token apply_changes will demand.
+    lines.extend(_render_file_evidence(files))
+    lines.extend(_render_warnings(payload))
+    return "\n".join(lines)
+
+
+def _render_file_evidence(files: Any) -> list[str]:
+    if not isinstance(files, list):
+        return []
+    rendered: list[str] = []
+    for entry in files:
+        if not isinstance(entry, dict) or not entry.get("revision"):
+            continue
+        parts = [
+            f"{entry.get('path', '')}: revision={entry['revision']}",
+            f"total_lines={entry.get('total_lines', '?')}",
+        ]
+        ranges = entry.get("changed_ranges")
+        if isinstance(ranges, list) and ranges:
+            spans = ", ".join(
+                f"{item.get('start_line')}-{item.get('end_line')}"
+                for item in ranges
+                if isinstance(item, dict)
+            )
+            parts.append(f"changed lines {spans}")
+        quality = entry.get("match_quality")
+        if isinstance(quality, str) and quality and quality != "exact":
+            parts.append(f"match_quality={quality}")
+        rendered.append(" ".join(parts))
+    return rendered
+
+
+def _render_warnings(payload: dict[str, Any]) -> list[str]:
+    warnings = payload.get("warnings")
+    if not isinstance(warnings, list):
+        return []
+    return [f"Warning: {item}" for item in warnings if isinstance(item, str) and item]
 
 
 def _render_exec(payload: dict[str, Any]) -> str:
@@ -403,6 +453,7 @@ _RENDERERS = {
     "list_files": _render_list,
     "search_text": _render_search,
     "apply_patch": _render_patch,
+    "apply_changes": _render_changes,
     "exec_command": _render_exec,
     "write_stdin": _render_exec,
     "kill_command": _render_kill,

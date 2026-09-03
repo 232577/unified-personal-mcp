@@ -22,11 +22,16 @@ from coding_tools_mcp import telemetry as telemetry_module
 from coding_tools_mcp.patching import (
     AtomicPatchCommitter,
     FileBaseline,
+    PatchHunk,
     StagedFile,
     apply_update_hunks,
+    apply_update_hunks_detailed,
+    content_revision,
     parse_patch,
 )
 from coding_tools_mcp.server import (
+    DEFAULT_PROCESS_LIFETIME_MS,
+    DEFAULT_YIELD_MS,
     LANDLOCK_ACCESS_FS_IOCTL_DEV,
     LANDLOCK_ACCESS_FS_TRUNCATE,
     LANDLOCK_ACCESS_FS_WRITE_FILE,
@@ -119,6 +124,23 @@ class RuntimeHelperTests(unittest.TestCase):
                 )
         self.assertEqual(raised.exception.code, "TTY_UNSUPPORTED")
         self.assertEqual(raised.exception.details.get("platform"), "nt")
+
+    def test_popen_oserror_is_reported_as_a_spawn_error_outcome(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="dangerous")
+            try:
+                with patch.object(
+                    processes_module.subprocess,
+                    "Popen",
+                    side_effect=OSError(12, "cannot allocate memory"),
+                ):
+                    result = runtime.call_tool("exec_command", {"cmd": "true"})
+            finally:
+                runtime.close()
+        self.assertTrue(result["isError"])
+        payload = result["structuredContent"]
+        self.assertEqual(payload["operation_outcome"], "spawn_error")
+        self.assertEqual(payload["error"]["code"], "COMMAND_SPAWN_FAILED")
 
     def test_windows_process_termination_distinguishes_graceful_and_force(self) -> None:
         class FakeProcess:
@@ -938,7 +960,9 @@ Maven home: /usr/share/maven
                 if item.get("type") == "text"
             )
             self.assertEqual(payload["content"], content)
-            self.assertEqual(model_text, content)
+            # The banner names the revision apply_changes will ask for; the
+            # content below it must still arrive whole.
+            self.assertEqual(model_text, f"[Showing lines 1-1 of 1 revision={payload['revision']}]\n{content}")
             self.assertNotIn("preview truncated", model_text)
 
     def agent_text(self, result: dict[str, object]) -> str:
@@ -1451,6 +1475,51 @@ Maven home: /usr/share/maven
                 self.assertEqual(third.get("content"), data[60:].decode())
                 self.assertIsNone(third.get("next_offset"))
 
+    def test_the_read_output_schema_names_only_fields_the_tool_returns(self) -> None:
+        # The declared schema is a promise to the model. It used to name
+        # total_bytes and the head-truncation fields (truncated_by,
+        # output_lines, output_bytes), none of which this tool ever returns.
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            with subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                command = server_module.CommandRun(command_id="declared", process=process, buffer_limit=32)
+                command.append_stdout(b"abcdefghij")
+                runtime._remember_output_command(command)
+                paged = runtime.read_output({"output_ref": "command:declared:stdout", "offset": 0, "limit": 4})
+                complete = runtime.read_output({"output_ref": "command:declared:stdout", "offset": 0, "limit": 64})
+        declared = set(server_module.output_schemas()["read_output"])
+        # next_action only appears while there is more to read, so the two
+        # reads together have to cover the schema exactly.
+        self.assertEqual(declared - (set(paged) | set(complete)), set())
+        self.assertEqual(set(complete) - declared, {"ok"})
+
+    def test_the_kill_command_schema_declares_its_command_and_kill_fields(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            try:
+                running = runtime.exec_command(
+                    {"cmd": "sleep 5", "yield_time_ms": 0, "timeout_ms": 10_000}
+                )
+                killed = runtime.kill_command(
+                    {"command_id": running["command_id"], "signal": "KILL"}
+                )
+            finally:
+                runtime.close()
+        declared = set(server_module.output_schemas()["kill_command"])
+        self.assertEqual(set(killed) - declared, {"ok"})
+        self.assertTrue(
+            {
+                "operation_outcome",
+                "killed",
+                "evicted",
+                "signal",
+                "signal_sent",
+                "stdout",
+                "stderr",
+            }
+            <= declared
+        )
+
     def test_output_retention_counters_track_evicted_output_and_reach_telemetry(self) -> None:
         data = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?"
         events: list[dict[str, Any]] = []
@@ -1483,6 +1552,11 @@ Maven home: /usr/share/maven
                     {
                         "buffer_bytes_per_stream": server_module.COMMAND_BUFFER_BYTES,
                         "head_bytes_per_stream": server_module.COMMAND_BUFFER_BYTES // 8,
+                        # Output does not only get trimmed, it expires and gets
+                        # dropped wholesale; limitations.md promises both are
+                        # discoverable here rather than only in the source.
+                        "completed_command_ttl_seconds": server_module.COMPLETED_COMMAND_TTL_SECONDS,
+                        "max_retained_completed_commands": server_module.MAX_RETAINED_OUTPUT_COMMANDS,
                     },
                 )
 
@@ -1764,6 +1838,575 @@ class PatchLineFidelityTests(unittest.TestCase):
             apply_update_hunks("alpha\nomega\n", [[" omega", "+tail"]]),
             "alpha\nomega\ntail\n",
         )
+
+
+DUPLICATE_SCOPES = 'def greet(n):\n    print("hi")\n\n\ndef farewell(n):\n    print("hi")\n'
+
+
+class PatchLocatorTests(unittest.TestCase):
+    """The `@@` scope anchor, `*** End of File`, and graded matching."""
+
+    def test_scope_header_text_is_retained_per_hunk(self) -> None:
+        operations = parse_patch(
+            "*** Begin Patch\n*** Update File: a.py\n@@ def farewell\n-x\n+y\n*** End Patch\n"
+        )
+        self.assertEqual(operations[0].hunks[0].scope, "def farewell")
+
+    def test_unified_diff_position_header_is_not_treated_as_scope(self) -> None:
+        operations = parse_patch(
+            "*** Begin Patch\n*** Update File: a.py\n@@ -1,4 +1,4 @@\n-x\n+y\n*** End Patch\n"
+        )
+        self.assertIsNone(operations[0].hunks[0].scope)
+
+    def test_scope_selects_between_identical_bodies(self) -> None:
+        outcome = apply_update_hunks_detailed(
+            DUPLICATE_SCOPES, [PatchHunk(['-    print("hi")', '+    print("bye")'], "def farewell")]
+        )
+        self.assertEqual(
+            outcome.content,
+            'def greet(n):\n    print("hi")\n\n\ndef farewell(n):\n    print("bye")\n',
+        )
+
+    def test_scope_warning_is_only_emitted_when_the_scope_narrows_candidates(self) -> None:
+        outcome = apply_update_hunks_detailed(
+            "def farewell(n):\n    print('hi')\n",
+            [PatchHunk(["-    print('hi')", "+    print('bye')"], "def farewell")],
+        )
+        self.assertFalse(any("@@ scope" in warning for warning in outcome.warnings))
+
+    def test_missing_scope_leaves_identical_bodies_ambiguous(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed(DUPLICATE_SCOPES, [['-    print("hi")', '+    print("bye")']])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_AMBIGUOUS")
+        self.assertEqual(raised.exception.details["candidate_lines"], [2, 6])
+        self.assertIn("2: ", raised.exception.details["candidates"][0]["text"])
+
+    def test_end_of_file_marker_anchors_the_last_occurrence(self) -> None:
+        outcome = apply_update_hunks_detailed(
+            "beta\nbeta\nbeta\n", [["-beta", "+omega", "*** End of File"]]
+        )
+        self.assertEqual(outcome.content, "beta\nbeta\nomega\n")
+
+    def test_end_of_file_marker_survives_the_envelope_parser(self) -> None:
+        operations = parse_patch(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-beta\n+omega\n*** End of File\n*** End Patch\n"
+        )
+        self.assertEqual(operations[0].hunks[0].lines[-1], "*** End of File")
+
+
+class GradedMatchingTests(unittest.TestCase):
+    def test_trailing_whitespace_downgrade_is_labeled_and_preserves_the_file_line(self) -> None:
+        outcome = apply_update_hunks_detailed("keep  \nold\n", [[" keep", "-old", "+new"]])
+        self.assertEqual(outcome.match_quality, "trailing_ws")
+        # The context line is reinstated from the file, so tolerating the
+        # difference does not silently strip the file's trailing spaces.
+        self.assertEqual(outcome.content, "keep  \nnew\n")
+        self.assertIn("trailing whitespace", " ".join(outcome.warnings))
+
+    def test_indent_downgrade_reindents_added_lines_by_the_uniform_delta(self) -> None:
+        outcome = apply_update_hunks_detailed(
+            "class S:\n    def run(self):\n        value = 1\n        return value\n",
+            [[" value = 1", "-return value", "+return value * 2"]],
+        )
+        self.assertEqual(outcome.match_quality, "indent")
+        self.assertEqual(
+            outcome.content,
+            "class S:\n    def run(self):\n        value = 1\n        return value * 2\n",
+        )
+
+    def test_non_uniform_indent_drift_is_not_guessed_at(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed(
+                "    alpha\n        beta\n",
+                [[" alpha", "-  beta", "+  gamma"]],
+            )
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_a_fuzzy_grade_that_matches_twice_is_still_ambiguous(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed("old \nold  \n", [["-old", "+new"]])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_AMBIGUOUS")
+        self.assertEqual(raised.exception.details["match_quality"], "trailing_ws")
+
+    def test_exact_matches_are_labeled_exact_and_warn_about_nothing(self) -> None:
+        outcome = apply_update_hunks_detailed("old\n", [["-old", "+new"]])
+        self.assertEqual(outcome.match_quality, "exact")
+        self.assertEqual(outcome.warnings, [])
+
+
+class SamePathChainingTests(unittest.TestCase):
+    """Two `*** Update File` blocks naming one path chain, in order.
+
+    `scripts/repro_patch_failures.py` states the same promise as an executable
+    case and runs in CI as `make test-patch-repro`; this is the unit-test half,
+    so the guarantee cannot regress unnoticed in either runner.
+    """
+
+    @contextmanager
+    def _runtime(self, content: str) -> Iterator[tuple[Path, Runtime]]:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "app.py").write_text(content, encoding="utf-8")
+            runtime = Runtime(workspace, permission_mode="safe")
+            try:
+                yield workspace, runtime
+            finally:
+                runtime.close()
+
+    def test_the_second_block_sees_the_first_blocks_result(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-one\n"
+            "+ONE\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-two\n"
+            "+TWO\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("one\ntwo\n") as (workspace, runtime):
+            payload = runtime.apply_patch({"patch": patch_text})
+            self.assertEqual((workspace / "app.py").read_text(encoding="utf-8"), "ONE\nTWO\n")
+            # One file, staged and evidenced once. Intermediate revisions never
+            # existed on disk and must not be advertised as post-edit evidence.
+            self.assertEqual([entry["path"] for entry in payload["affected_files"]], ["app.py"])
+            evidence = payload["affected_files"][0]
+            self.assertEqual(
+                evidence["revision"],
+                content_revision((workspace / "app.py").read_text(encoding="utf-8")),
+            )
+            self.assertNotEqual(evidence["revision"], content_revision("ONE\ntwo\n"))
+            self.assertEqual(
+                evidence["changed_ranges"],
+                [
+                    {"start_line": 1, "end_line": 2, "added_lines": 2, "removed_lines": 2},
+                ],
+            )
+
+    def test_a_later_block_may_edit_what_an_earlier_block_wrote(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-one\n"
+            "+first\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-first\n"
+            "+FIRST\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("one\ntwo\n") as (workspace, runtime):
+            runtime.apply_patch({"patch": patch_text})
+            self.assertEqual((workspace / "app.py").read_text(encoding="utf-8"), "FIRST\ntwo\n")
+
+    def test_changed_ranges_are_rebased_against_the_final_chained_text(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-b\n"
+            "+B\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "+x\n"
+            " a\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("a\nb\nc\n") as (workspace, runtime):
+            payload = runtime.apply_patch({"patch": patch_text})
+            self.assertEqual((workspace / "app.py").read_text(encoding="utf-8"), "x\na\nB\nc\n")
+            self.assertEqual(
+                payload["affected_files"][0]["changed_ranges"],
+                [
+                    {"start_line": 1, "end_line": 1, "added_lines": 1, "removed_lines": 0},
+                    {"start_line": 3, "end_line": 3, "added_lines": 1, "removed_lines": 1},
+                ],
+            )
+
+    def test_nested_insert_expands_an_earlier_added_span(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            " start\n"
+            "+line1\n"
+            "+line2\n"
+            "+line3\n"
+            " end\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            " line1\n"
+            "+line1b\n"
+            " line2\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("start\nend\n") as (workspace, runtime):
+            payload = runtime.apply_patch({"patch": patch_text})
+            self.assertEqual(
+                (workspace / "app.py").read_text(encoding="utf-8"),
+                "start\nline1\nline1b\nline2\nline3\nend\n",
+            )
+            self.assertEqual(
+                payload["affected_files"][0]["changed_ranges"],
+                [{"start_line": 2, "end_line": 5, "added_lines": 4, "removed_lines": 0}],
+            )
+
+    def test_chained_already_applied_blocks_verify_without_rewriting(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            " anchor-one\n"
+            "-old-one\n"
+            "+new-one\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            " anchor-two\n"
+            "-old-two\n"
+            "+new-two\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("anchor-one\nnew-one\nanchor-two\nnew-two\n") as (workspace, runtime):
+            path = workspace / "app.py"
+            os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+            before = path.stat().st_mtime_ns
+            payload = runtime.apply_patch({"patch": patch_text})
+
+            self.assertEqual(path.stat().st_mtime_ns, before)
+            self.assertIs(payload["already_applied"], True)
+            self.assertEqual(payload["affected_files"][0]["operation"], "unchanged")
+            self.assertEqual(payload["affected_files"][0]["changed_ranges"], [])
+
+    def test_chained_edits_that_restore_the_baseline_verify_without_rewriting(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-one\n"
+            "+ONE\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-ONE\n"
+            "+one\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("one\ntwo\n") as (workspace, runtime):
+            path = workspace / "app.py"
+            os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+            before = path.stat().st_mtime_ns
+            payload = runtime.apply_patch({"patch": patch_text})
+
+            self.assertEqual(path.read_text(encoding="utf-8"), "one\ntwo\n")
+            self.assertEqual(path.stat().st_mtime_ns, before)
+            self.assertIs(payload["already_applied"], False)
+            self.assertEqual(payload["affected_files"][0]["operation"], "unchanged")
+            self.assertEqual(payload["affected_files"][0]["changed_ranges"], [])
+
+    def test_update_then_move_reports_only_final_destination_evidence(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            " a\n"
+            "-b\n"
+            "+B\n"
+            "-c\n"
+            "+C\n"
+            " d\n"
+            "*** Update File: app.py\n"
+            "*** Move to: moved.py\n"
+            "@@\n"
+            " B\n"
+            "+x\n"
+            " C\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("a\nb\nc\nd\n") as (workspace, runtime):
+            payload = runtime.apply_patch({"patch": patch_text})
+            final = "a\nB\nx\nC\nd\n"
+            self.assertFalse((workspace / "app.py").exists())
+            self.assertEqual((workspace / "moved.py").read_text(encoding="utf-8"), final)
+            self.assertEqual(len(payload["affected_files"]), 1)
+            evidence = payload["affected_files"][0]
+            self.assertEqual(evidence["path"], "moved.py")
+            self.assertEqual(evidence["old_path"], "app.py")
+            self.assertEqual(evidence["operation"], "move")
+            self.assertEqual(evidence["revision"], content_revision(final))
+            self.assertEqual(
+                evidence["changed_ranges"],
+                [{"start_line": 2, "end_line": 4, "added_lines": 3, "removed_lines": 2}],
+            )
+
+    def test_delete_evidence_does_not_inherit_update_match_quality(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-one\n"
+            "+ONE\n"
+            "*** Delete File: app.py\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("one\n") as (_workspace, runtime):
+            payload = runtime.apply_patch({"patch": patch_text})
+        evidence = payload["affected_files"][0]
+        self.assertEqual(evidence["operation"], "delete")
+        self.assertNotIn("match_quality", evidence)
+
+
+class PatchEvidenceAndIdempotencyTests(unittest.TestCase):
+    def test_changed_ranges_name_only_the_lines_that_differ(self) -> None:
+        outcome = apply_update_hunks_detailed(
+            "a\nb\nc\n", [[" a", "-b", "+B", " c"]]
+        )
+        self.assertEqual(
+            outcome.changed_ranges,
+            [{"start_line": 2, "end_line": 2, "added_lines": 1, "removed_lines": 1}],
+        )
+
+    def test_context_free_hunks_are_numbered_where_their_lines_landed(self) -> None:
+        # Two hunks with no context both place at the top of the file, and
+        # back-to-front splicing puts the later one first. The ranges have to
+        # follow the text rather than the hunk order.
+        outcome = apply_update_hunks_detailed("z\n", [["+A1", "+A2"], ["+B1"]])
+        self.assertEqual(outcome.content, "B1\nA1\nA2\nz\n")
+        self.assertEqual(
+            outcome.changed_ranges,
+            [
+                {"start_line": 1, "end_line": 1, "added_lines": 1, "removed_lines": 0},
+                {"start_line": 2, "end_line": 3, "added_lines": 2, "removed_lines": 0},
+            ],
+        )
+
+    def test_pure_deletion_reports_an_empty_range_at_the_removal_point(self) -> None:
+        outcome = apply_update_hunks_detailed("a\nb\nc\n", [[" a", "-b", " c"]])
+        self.assertEqual(outcome.changed_ranges[0]["start_line"], 2)
+        self.assertEqual(outcome.changed_ranges[0]["end_line"], 1)
+        self.assertEqual(outcome.changed_ranges[0]["removed_lines"], 1)
+
+    def test_already_applied_hunks_are_skipped_rather_than_failing(self) -> None:
+        outcome = apply_update_hunks_detailed(
+            "def run():\n    value = 2\n", [[" def run():", "-    value = 1", "+    value = 2"]]
+        )
+        self.assertEqual(outcome.content, "def run():\n    value = 2\n")
+        self.assertEqual(outcome.already_applied_hunks, [0])
+        self.assertEqual(outcome.applied_hunks, 0)
+
+    def test_a_context_only_hunk_never_claims_to_be_already_applied(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed("a\n", [[" nowhere"]])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_one_common_line_somewhere_else_is_not_an_already_applied_hunk(self) -> None:
+        # The probe: the hunk carries no context, and its single added line
+        # happens to exist elsewhere in the file. Accepting that would report
+        # an edit that never landed as a success.
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed("alpha\nx = 2\nbeta\n", [["-x = 1", "+x = 2"]])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_blank_only_context_is_not_already_applied_evidence(self) -> None:
+        # split("\n") leaves a trailing "" in every newline-terminated file.
+        # That ubiquitous blank cannot prove a missing deletion ever happened.
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed("unrelated\n", [["-never existed", " "]])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_already_applied_evidence_must_be_unique(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed(
+                "anchor\nnew\nother\nanchor\nnew\n",
+                [[" anchor", "-old", "+new"]],
+            )
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_already_applied_evidence_must_be_inside_the_named_scope(self) -> None:
+        content = "def wrong():\n    marker\n    new\n\ndef target():\n    pass\n"
+        hunk = PatchHunk(
+            ["     marker", "-    old", "+    new"],
+            "def target",
+        )
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed(content, [hunk])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_already_applied_evidence_stops_at_the_next_scope(self) -> None:
+        content = "def target():\n    pass\n\ndef wrong():\n    marker\n    new\n"
+        hunk = PatchHunk(
+            ["     marker", "-    old", "+    new"],
+            "def target",
+        )
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed(content, [hunk])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_already_applied_evidence_must_reach_the_eof_anchor(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed(
+                "first\nsecond\ntrailing\n",
+                [["-old", "+first", "+second", "*** End of File"]],
+            )
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_an_indent_stripped_match_is_not_evidence_that_a_hunk_ran(self) -> None:
+        # `return None` under some other indentation is not this hunk's result.
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed(
+                "def a():\n        return None\n",
+                [[" def b():", "-    pass", "+    return None"]],
+            )
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_a_multi_line_addition_is_evidence_even_without_context(self) -> None:
+        outcome = apply_update_hunks_detailed(
+            "alpha\nfirst\nsecond\n", [["-old", "+first", "+second"]]
+        )
+        self.assertEqual(outcome.already_applied_hunks, [0])
+        self.assertEqual(outcome.content, "alpha\nfirst\nsecond\n")
+
+    def test_revision_is_the_sha256_of_the_files_utf8_bytes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "a.txt").write_text("alpha\n", encoding="utf-8")
+            runtime = Runtime(workspace, permission_mode="safe")
+            try:
+                payload = runtime.apply_patch(
+                    {"patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-alpha\n+beta\n*** End Patch\n"}
+                )
+            finally:
+                runtime.close()
+            self.assertEqual(
+                payload["affected_files"][0]["revision"],
+                content_revision((workspace / "a.txt").read_text(encoding="utf-8")),
+            )
+            self.assertEqual(payload["revision_algorithm"], "sha256")
+
+    def test_idempotency_key_replays_the_recorded_result(self) -> None:
+        patch_text = "*** Begin Patch\n*** Add File: new.txt\n+alpha\n*** End Patch\n"
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = Runtime(workspace, permission_mode="safe")
+            try:
+                first = runtime.call_tool("apply_patch", {"patch": patch_text, "idempotency_key": "k1"})
+                self.assertFalse(first["isError"])
+                self.assertNotIn("idempotent_replay", first["structuredContent"])
+                # The add would fail on its own ("file already exists"); under
+                # the same key the runtime answers with what it recorded.
+                second = runtime.call_tool("apply_patch", {"patch": patch_text, "idempotency_key": "k1"})
+                self.assertFalse(second["isError"])
+                self.assertIs(second["structuredContent"]["idempotent_replay"], True)
+                unkeyed = runtime.call_tool("apply_patch", {"patch": patch_text})
+                self.assertTrue(unkeyed["isError"])
+            finally:
+                runtime.close()
+
+    def test_a_failure_is_never_recorded_under_an_idempotency_key(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = Runtime(workspace, permission_mode="safe")
+            try:
+                broken = "*** Begin Patch\n*** Update File: absent.txt\n@@\n-a\n+b\n*** End Patch\n"
+                self.assertTrue(runtime.call_tool("apply_patch", {"patch": broken, "idempotency_key": "k2"})["isError"])
+                (workspace / "absent.txt").write_text("a\n", encoding="utf-8")
+                retried = runtime.call_tool("apply_patch", {"patch": broken, "idempotency_key": "k2"})
+                self.assertFalse(retried["isError"])
+                self.assertEqual((workspace / "absent.txt").read_text(encoding="utf-8"), "b\n")
+            finally:
+                runtime.close()
+
+    def test_not_found_failures_carry_numbered_repair_text(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed("alpha\nbeta\ngamma\n", [["-bета", "+delta"]])
+        details = raised.exception.details
+        self.assertEqual(details["hunk_index"], 0)
+        self.assertEqual(details["total_lines"], 4)
+        self.assertIn("1: alpha", details["nearby_text"])
+
+
+class ReadFileRevisionTests(unittest.TestCase):
+    """The revision read_file publishes has to name the bytes it just read."""
+
+    @contextmanager
+    def _runtime(self, content: str) -> Iterator[tuple[Path, Runtime]]:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "a.txt").write_text(content, encoding="utf-8")
+            runtime = Runtime(workspace, permission_mode="safe")
+            try:
+                yield workspace, runtime
+            finally:
+                runtime.close()
+
+    def test_revision_matches_the_hash_of_the_whole_file(self) -> None:
+        with self._runtime("alpha\nbeta\ngamma\n") as (workspace, runtime):
+            payload = runtime.read_file({"path": "a.txt"})
+            self.assertEqual(payload["revision_algorithm"], "sha256")
+            self.assertEqual(
+                payload["revision"],
+                content_revision((workspace / "a.txt").read_text(encoding="utf-8")),
+            )
+
+    def test_a_line_range_still_reports_the_whole_file_revision(self) -> None:
+        with self._runtime("alpha\nbeta\ngamma\n") as (workspace, runtime):
+            whole = runtime.read_file({"path": "a.txt"})
+            ranged = runtime.read_file({"path": "a.txt", "start_line": 2, "end_line": 2})
+            self.assertEqual(ranged["content"], "beta\n")
+            self.assertEqual(ranged["revision"], whole["revision"])
+
+    def test_apply_patch_reports_the_revision_a_later_read_confirms(self) -> None:
+        with self._runtime("alpha\n") as (_workspace, runtime):
+            patched = runtime.apply_patch(
+                {"patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-alpha\n+beta\n*** End Patch\n"}
+            )
+            self.assertEqual(
+                patched["affected_files"][0]["revision"],
+                runtime.read_file({"path": "a.txt"})["revision"],
+            )
+
+    def test_the_model_text_carries_the_revision(self) -> None:
+        with self._runtime("alpha\n") as (_workspace, runtime):
+            result = runtime.call_tool("read_file", {"path": "a.txt"})
+            text = result["content"][0]["text"]
+            self.assertIn(f"revision={result['structuredContent']['revision']}", text)
+            self.assertIn("alpha", text)
+
+
+class ProcessLifetimeTests(unittest.TestCase):
+    """Yielding a command back to the caller must not shorten its life.
+
+    Before v0.5.0 both budgets came from one 30s default, so a build that had
+    not finished by the first return was killed a few seconds later and the
+    model saw a truncated, unreproducible failure.
+    """
+
+    def test_the_defaults_keep_the_two_budgets_apart(self) -> None:
+        self.assertEqual(DEFAULT_YIELD_MS, 10000)
+        self.assertEqual(DEFAULT_PROCESS_LIFETIME_MS, 300000)
+        schema = server_module.input_schemas()["exec_command"]["properties"]
+        self.assertEqual(schema["timeout_ms"]["default"], DEFAULT_PROCESS_LIFETIME_MS)
+        self.assertEqual(schema["yield_time_ms"]["default"], DEFAULT_YIELD_MS)
+
+    def test_a_command_outliving_the_yield_keeps_running(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="dangerous")
+            try:
+                payload = runtime.exec_command(
+                    {"cmd": f"{sys.executable} -c 'import time; time.sleep(5)'", "yield_time_ms": 200}
+                )
+                command_id = payload.get("command_id")
+                self.assertEqual(payload.get("status"), "running")
+                self.assertIsInstance(command_id, str)
+                # The default lifetime is minutes away, so the process is still
+                # alive well after the call that started it returned.
+                time.sleep(0.5)
+                command = runtime.commands[str(command_id)]
+                self.assertIsNone(command.process.poll())
+                runtime.kill_command({"command_id": command_id, "signal": "KILL"})
+            finally:
+                runtime.close()
 
 
 class ErrorTextTerminalityTests(unittest.TestCase):

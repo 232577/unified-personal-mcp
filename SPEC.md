@@ -10,24 +10,28 @@ apply structured patches, run and interact with commands, and inspect Git. It is
 not an agent wrapper and does not expose accounts, memory, cloud tasks, web
 search, model routing, plugins, image generation, or subagent orchestration.
 
-## Fixed tool model
+## Tool model
 
 There is one stable catalog. The runtime has no tool profiles, no `edit_file`,
 no dynamic `tools/list_changed`, and no required `open_workspace` call.
-`apply_patch` is the only direct file-write tool. `safe`, `trusted`, and
-`dangerous` are command permission policies and never alter `tools/list`.
+`apply_patch` and `apply_changes` are the direct file-write tools. `safe`,
+`trusted`, and `dangerous` primarily govern command policy; they also govern
+whether `request_permissions` is useful enough to advertise.
 
-The default catalog contains 18 tools:
+The registry contains 19 tools; the default `safe` and `trusted` catalogs
+advertise 18:
 
 - runtime/context: `server_info`, `check_exec_environment`
 - workspace inspection: `read_file`, `list_dir`, `list_files`, `search_text`
-- mutation: `apply_patch`
+- mutation: `apply_patch`, `apply_changes`
 - processes: `exec_command`, `write_stdin`, `read_output`, `kill_command`
 - Git: `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`
-- policy/image: `request_permissions`, `view_image`
+- image: `view_image`
 
-`view_image` can be disabled as an installation capability. All other tools are
-fixed.
+`view_image` can be disabled as an installation capability.
+`request_permissions` is advertised only in `dangerous` mode, where it can
+return `granted`; its handler remains callable by name in every mode. The
+remaining 17 tools are always advertised, and `listChanged` is `false`.
 
 ## Protocol
 

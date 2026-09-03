@@ -4,7 +4,9 @@ import contextlib
 import io
 import json
 import os
+import sys
 import tempfile
+import time
 import unittest
 from collections.abc import Iterator
 from pathlib import Path
@@ -490,6 +492,212 @@ class FirstAppearanceLogTests(unittest.TestCase):
         )
         self.assertNotIn("forged operator note", output)
         self.assertNotIn("\x07", output)
+
+
+class FailureStreakKeyingTests(unittest.TestCase):
+    """D2: streaks belong to a (tool, error_code) pair, not to one global slot."""
+
+    def session(self) -> SessionTelemetry:
+        return SessionTelemetry(permission_mode="safe")
+
+    def fail(self, session: SessionTelemetry, tool: str, code: str) -> None:
+        session.record_tool_call(tool, ok=False, error_code=code, duration_ms=1, truncated=False)
+
+    def succeed(self, session: SessionTelemetry, tool: str, outcome: str | None = None) -> None:
+        session.record_tool_call(
+            tool, ok=True, error_code=None, duration_ms=1, truncated=False, outcome=outcome
+        )
+
+    def test_another_tools_success_does_not_clear_a_streak(self) -> None:
+        session = self.session()
+        self.fail(session, "apply_patch", "PATCH_CONTEXT_NOT_FOUND")
+        self.fail(session, "apply_patch", "PATCH_CONTEXT_NOT_FOUND")
+        self.succeed(session, "read_file")
+        self.fail(session, "apply_patch", "PATCH_CONTEXT_NOT_FOUND")
+        self.assertEqual(session.consecutive_failures("apply_patch", "PATCH_CONTEXT_NOT_FOUND"), 3)
+
+    def test_two_error_codes_on_one_tool_count_separately(self) -> None:
+        session = self.session()
+        self.fail(session, "apply_patch", "PATCH_CONTEXT_NOT_FOUND")
+        self.fail(session, "apply_patch", "PATCH_CONFLICT")
+        self.assertEqual(session.consecutive_failures("apply_patch", "PATCH_CONTEXT_NOT_FOUND"), 1)
+        self.assertEqual(session.consecutive_failures("apply_patch", "PATCH_CONFLICT"), 1)
+
+    def test_a_success_of_the_same_tool_clears_its_streaks(self) -> None:
+        session = self.session()
+        self.fail(session, "apply_patch", "PATCH_CONTEXT_NOT_FOUND")
+        self.succeed(session, "apply_patch")
+        self.assertEqual(session.consecutive_failures("apply_patch", "PATCH_CONTEXT_NOT_FOUND"), 0)
+
+    def test_a_failed_operation_is_not_a_success_and_clears_nothing(self) -> None:
+        session = self.session()
+        self.fail(session, "exec_command", "INVALID_ARGUMENT")
+        self.succeed(session, "exec_command", outcome="exited_nonzero")
+        self.assertEqual(session.consecutive_failures("exec_command", "INVALID_ARGUMENT"), 1)
+        self.succeed(session, "exec_command", outcome="exited_0")
+        self.assertEqual(session.consecutive_failures("exec_command", "INVALID_ARGUMENT"), 0)
+
+
+class OperationOutcomeTests(unittest.TestCase):
+    """D1: a command that exits non-zero is not a successful operation."""
+
+    def test_tool_summary_separates_call_success_from_operation_success(self) -> None:
+        sender = _CapturingSender()
+        with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="on"), patch.object(
+            telemetry, "_get_sender", return_value=sender
+        ):
+            session = SessionTelemetry(permission_mode="safe")
+            session.record_request(LEGACY_PROTOCOL_VERSION, "tools/call")
+            for outcome in ("exited_0", "exited_nonzero", "timeout", "signal"):
+                session.record_tool_call(
+                    "exec_command",
+                    ok=True,
+                    error_code=None,
+                    duration_ms=1,
+                    truncated=False,
+                    outcome=outcome,
+                )
+            session.finish()
+        summary = next(
+            _properties(event)
+            for event in sender.events
+            if event["event"] == "tool_summary" and _properties(event)["tool"] == "exec_command"
+        )
+        self.assertEqual(summary["calls"], 4)
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["operation_failures"], 3)
+        self.assertEqual(summary["outcome_exited_nonzero"], 1)
+        self.assertEqual(summary["outcome_timeout"], 1)
+        self.assertEqual(summary["outcome_signal"], 1)
+
+    def test_spawn_error_is_not_counted_as_two_failures(self) -> None:
+        sender = _CapturingSender()
+        with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="on"), patch.object(
+            telemetry, "_get_sender", return_value=sender
+        ):
+            session = SessionTelemetry(permission_mode="safe")
+            session.record_request(LEGACY_PROTOCOL_VERSION, "tools/call")
+            session.record_tool_call(
+                "exec_command",
+                ok=False,
+                error_code="COMMAND_SPAWN_FAILED",
+                duration_ms=1,
+                truncated=False,
+                outcome="spawn_error",
+            )
+            session.finish()
+        summary = next(
+            _properties(event)
+            for event in sender.events
+            if event["event"] == "tool_summary" and _properties(event)["tool"] == "exec_command"
+        )
+        self.assertEqual(summary["calls"], 1)
+        self.assertEqual(summary["ok"], 0)
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["operation_failures"], 0)
+        self.assertEqual(summary["outcome_spawn_error"], 1)
+
+    def test_a_nonzero_exit_is_reported_as_the_operation_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="safe")
+            try:
+                payload = runtime.exec_command({"cmd": "exit 3", "timeout_ms": 5000})
+            finally:
+                runtime.close()
+        self.assertIs(payload["ok"], True)
+        self.assertEqual(payload["exit_code"], 3)
+        self.assertEqual(payload["operation_outcome"], "exited_nonzero")
+
+    def test_a_poll_observed_failure_is_attributed_to_exec_command(self) -> None:
+        # Every poll of a finished command reports the same terminal outcome.
+        # Counting each one turned a single failing build into as many failed
+        # operations as the model happened to poll.
+        sender = _CapturingSender()
+        with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="on"), patch.object(
+            telemetry, "_get_sender", return_value=sender
+        ), tempfile.TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            try:
+                runtime.telemetry.record_request(LEGACY_PROTOCOL_VERSION, "tools/call")
+                command = (
+                    f'"{sys.executable}" -c "import sys,time; '
+                    'time.sleep(0.2); sys.exit(7)"'
+                )
+                started = runtime.call_tool(
+                    "exec_command",
+                    {"cmd": command, "yield_time_ms": 1, "timeout_ms": 5000},
+                )
+                command_id = started["structuredContent"]["command_id"]
+                self.assertEqual(started["structuredContent"]["operation_outcome"], "running")
+                poll_calls = 0
+                for _ in range(20):
+                    polled = runtime.call_tool(
+                        "write_stdin",
+                        {"command_id": command_id, "chars": "", "yield_time_ms": 250},
+                    )
+                    poll_calls += 1
+                    if polled["structuredContent"]["operation_outcome"] != "running":
+                        break
+                # The poll still tells the truth about the command…
+                self.assertEqual(polled["structuredContent"]["operation_outcome"], "exited_nonzero")
+                repeated = runtime.call_tool("write_stdin", {"command_id": command_id, "chars": ""})
+                poll_calls += 1
+                self.assertEqual(repeated["structuredContent"]["operation_outcome"], "exited_nonzero")
+            finally:
+                runtime.close()
+        summaries = {
+            _properties(event)["tool"]: _properties(event)
+            for event in sender.events
+            if event["event"] == "tool_summary"
+        }
+        # … but the failed operation is counted once, by the call that ran it.
+        self.assertEqual(summaries["exec_command"]["outcome_exited_nonzero"], 1)
+        self.assertEqual(summaries["exec_command"]["operation_failures"], 1)
+        self.assertNotIn("outcome_exited_nonzero", summaries["write_stdin"])
+        self.assertEqual(summaries["write_stdin"]["operation_failures"], 0)
+        self.assertEqual(summaries["write_stdin"]["calls"], poll_calls)
+        self.assertEqual(summaries["write_stdin"]["ok"], poll_calls)
+
+    def test_every_terminal_observer_attributes_the_outcome_to_exec_command(self) -> None:
+        for observer in ("write_stdin", "read_output", "kill_command"):
+            with self.subTest(observer=observer), scrubbed_env(
+                CODING_TOOLS_MCP_TELEMETRY="on"
+            ), patch.object(telemetry, "_get_sender", return_value=(sender := _CapturingSender())):
+                with tempfile.TemporaryDirectory() as tmp:
+                    runtime = Runtime(Path(tmp), permission_mode="safe")
+                    runtime.telemetry.record_request(LEGACY_PROTOCOL_VERSION, "tools/call")
+                    started_at = time.time()
+                    runtime.emit_tool_trace(
+                        "exec_command",
+                        {},
+                        {"ok": True, "command_id": "background", "operation_outcome": "running"},
+                        started_at,
+                    )
+                    runtime.emit_tool_trace(
+                        observer,
+                        {},
+                        {
+                            "ok": True,
+                            "command_id": "background",
+                            "operation_outcome": "exited_nonzero",
+                        },
+                        started_at,
+                    )
+                    runtime.close()
+
+                summaries = {
+                    _properties(event)["tool"]: _properties(event)
+                    for event in sender.events
+                    if event["event"] == "tool_summary"
+                }
+                self.assertEqual(summaries["exec_command"]["calls"], 1)
+                self.assertEqual(summaries["exec_command"]["ok"], 0)
+                self.assertEqual(summaries["exec_command"]["operation_failures"], 1)
+                self.assertEqual(summaries["exec_command"]["outcome_exited_nonzero"], 1)
+                self.assertEqual(summaries[observer]["calls"], 1)
+                self.assertEqual(summaries[observer]["ok"], 1)
+                self.assertEqual(summaries[observer]["operation_failures"], 0)
+                self.assertNotIn("outcome_exited_nonzero", summaries[observer])
 
 
 class DocumentationDriftTests(unittest.TestCase):

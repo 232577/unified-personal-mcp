@@ -76,6 +76,13 @@ _RETENTION_COUNTERS = (
     "read_output_omitted_hits",
     "poll_omitted_hits",
 )
+# Operation-level outcomes that mean the work failed even though the tool call
+# itself completed. Counting these as successes is what let a dashboard report
+# a failing build as a win.
+FAILED_OPERATION_OUTCOMES = frozenset({"exited_nonzero", "timeout", "signal", "spawn_error"})
+# A tool may pin one failure streak per error code; the cap stops a client
+# cycling error codes from growing the map without bound.
+MAX_TRACKED_FAILURE_STREAKS = 128
 _LOG_PREFIX = "coding-tools-mcp"
 
 
@@ -308,7 +315,10 @@ class SessionTelemetry:
         self._discover_probes = 0
         self._error_events_sent = 0
         self._errors_dropped = 0
-        self._failure_streak: tuple[str, int] | None = None
+        # Keyed by (tool, error_code) rather than held in one global slot: a
+        # single slot reset by any success of any tool cannot tell a model
+        # stuck in a loop from a model making progress alongside one failure.
+        self._failure_streaks: dict[tuple[str, str], int] = {}
         self._active = False
         self._finished = False
         self._lock = threading.Lock()
@@ -382,12 +392,30 @@ class SessionTelemetry:
         duration_ms: int,
         truncated: bool,
         context: Any = None,
+        outcome: str | None = None,
     ) -> None:
+        """Count one tool call.
+
+        ``ok`` is transport-level: the call was dispatched and returned.
+        ``outcome`` is operation-level, set by tools that run something whose
+        result is not the call's result — a command that exits non-zero is a
+        successful call and a failed operation, and only the operation is what
+        a failure rate should be measured against.
+        """
+
         emit_error: tuple[str, int] | None = None
+        operation_failed = outcome in FAILED_OPERATION_OUTCOMES
         with self._lock:
             stats = self._tools.get(tool)
             if stats is None:
-                stats = self._tools[tool] = {"calls": 0, "errors": {}, "buckets": {}, "truncated": 0}
+                stats = self._tools[tool] = {
+                    "calls": 0,
+                    "errors": {},
+                    "buckets": {},
+                    "truncated": 0,
+                    "outcomes": {},
+                    "operation_failures": 0,
+                }
             stats["calls"] += 1
             bucket = _DURATION_OVERFLOW
             for limit, name in _DURATION_BUCKETS:
@@ -397,15 +425,26 @@ class SessionTelemetry:
             stats["buckets"][bucket] = stats["buckets"].get(bucket, 0) + 1
             if truncated:
                 stats["truncated"] += 1
-            if ok:
-                self._failure_streak = None
+            if outcome:
+                label = _label(outcome) or "unknown"
+                stats["outcomes"][label] = stats["outcomes"].get(label, 0) + 1
+            if ok and operation_failed:
+                # Operation failures are successful tool dispatches whose
+                # underlying command failed. A spawn_error is itself a tool
+                # error, so counting its outcome again would make one call
+                # contribute two failures and could drive `ok` negative.
+                stats["operation_failures"] += 1
+            if ok and not operation_failed:
+                self._clear_streaks_locked(tool)
+            elif ok:
+                # A failed operation neither clears a streak nor is a protocol
+                # error, so it is counted as an outcome and nothing else.
+                pass
             else:
                 code = _label(error_code) or "UNKNOWN"
                 stats["errors"][code] = stats["errors"].get(code, 0) + 1
-                streak = 1
-                if self._failure_streak and self._failure_streak[0] == tool:
-                    streak = self._failure_streak[1] + 1
-                self._failure_streak = (tool, streak)
+                streak = self._failure_streaks.get((tool, code), 0) + 1
+                self._record_streak_locked(tool, code, streak)
                 if self._active:
                     if self._error_events_sent < ERROR_EVENTS_PER_SESSION:
                         self._error_events_sent += 1
@@ -430,6 +469,44 @@ class SessionTelemetry:
                 ]
             )
 
+    def record_deferred_operation_outcome(self, tool: str, outcome: str) -> None:
+        """Attach a later-observed terminal outcome to its original tool call.
+
+        Background commands can still be running when ``exec_command`` returns,
+        so a polling tool may be the first call to observe the terminal result.
+        The result belongs to the already-recorded ``exec_command`` call; this
+        updates that tool's operation counters without adding another call.
+        """
+
+        operation_failed = outcome in FAILED_OPERATION_OUTCOMES
+        with self._lock:
+            stats = self._tools.get(tool)
+            if stats is None:
+                # The owning call belongs to another runtime/session. Avoid a
+                # summary with a failure but no corresponding call.
+                return
+            label = _label(outcome) or "unknown"
+            stats["outcomes"][label] = stats["outcomes"].get(label, 0) + 1
+            if operation_failed:
+                stats["operation_failures"] += 1
+            else:
+                self._clear_streaks_locked(tool)
+
+    def _clear_streaks_locked(self, tool: str) -> None:
+        for key in [key for key in self._failure_streaks if key[0] == tool]:
+            del self._failure_streaks[key]
+
+    def _record_streak_locked(self, tool: str, code: str, streak: int) -> None:
+        self._failure_streaks[(tool, code)] = streak
+        while len(self._failure_streaks) > MAX_TRACKED_FAILURE_STREAKS:
+            self._failure_streaks.pop(next(iter(self._failure_streaks)))
+
+    def consecutive_failures(self, tool: str, error_code: str) -> int:
+        """Current streak for one (tool, error_code) pair; 0 when unbroken."""
+
+        with self._lock:
+            return self._failure_streaks.get((tool, _label(error_code) or "UNKNOWN"), 0)
+
     def finish(self, *, output_retention: Mapping[str, int] | None = None) -> None:
         with self._lock:
             if self._finished:
@@ -441,15 +518,22 @@ class SessionTelemetry:
             events = []
             for tool, stats in sorted(self._tools.items()):
                 failures = sum(stats["errors"].values())
+                outcomes: dict[str, int] = stats.get("outcomes", {})
+                operation_failures = int(stats.get("operation_failures", 0))
                 properties: dict[str, Any] = {
                     "tool": _label(tool),
                     "calls": stats["calls"],
-                    "ok": stats["calls"] - failures,
+                    # Operation-level: a call that ran a command which then
+                    # failed is not counted here.
+                    "ok": stats["calls"] - failures - operation_failures,
                     "errors": failures,
+                    "operation_failures": operation_failures,
                     "truncated": stats["truncated"],
                 }
                 for code, count in sorted(stats["errors"].items()):
                     properties[f"err_{code}"] = count
+                for name, count in sorted(outcomes.items()):
+                    properties[f"outcome_{name}"] = count
                 properties.update(stats["buckets"])
                 events.append(self._event("tool_summary", properties))
             end_properties: dict[str, Any] = {

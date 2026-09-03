@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
+import errno
 import hashlib
 import html
 import difflib
@@ -25,6 +26,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -49,11 +51,25 @@ from .oauth import (
     validate_access_token,
     verify_pkce,
 )
+from .breaker import RepeatFailureBreaker, argument_fingerprint
+from .changes import (
+    CHANGE_ACTIONS,
+    EDIT_OPERATIONS,
+    MAX_CHANGES_PER_CALL,
+    MAX_EDITS_PER_CHANGE,
+    ChangeRequest,
+    apply_line_edits,
+    parse_changes,
+    reject_duplicate_paths,
+)
 from .patching import (
+    REVISION_ALGORITHM,
     AtomicPatchCommitter,
     FileBaseline,
     StagedFile,
-    apply_update_hunks,
+    apply_update_hunks_detailed,
+    changed_ranges_between,
+    content_revision,
     parse_patch,
     read_text_preserve_newlines,
 )
@@ -61,7 +77,9 @@ from .processes import (
     HARD_KILL_SIGNAL,
     COMMAND_BUFFER_BYTES,
     COMMAND_HEAD_BUFFER_DIVISOR,
+    COMMAND_OUTCOMES,
     CommandRun,
+    command_outcome,
     spawn_process,
     start_reader_threads,
     start_command_watchdog,
@@ -198,6 +216,37 @@ MAX_ACTIVE_COMMANDS = 16
 MAX_RETAINED_OUTPUT_COMMANDS = 32
 COMPLETED_COMMAND_TTL_SECONDS = 300
 MAX_RUNTIME_OUTPUT_BYTES = 16 * 1024 * 1024
+# timeout_ms is the total process lifetime and yield_time_ms is only how long
+# the call waits before returning a command_id. They are separate budgets: a
+# build that outlives the first return keeps running until the lifetime ends.
+DEFAULT_PROCESS_LIFETIME_MS = 300000
+MAX_PROCESS_LIFETIME_MS = 600000
+DEFAULT_YIELD_MS = 10000
+MAX_YIELD_MS = 30000
+MAX_UNTRACKED_DIFF_FILES = 100
+# A mutating call may be retried because its response was lost, not because it
+# failed. Tools in this set accept an idempotency_key and replay the recorded
+# result for a repeat of the same key instead of applying the work twice.
+IDEMPOTENT_TOOLS = frozenset({"apply_patch", "apply_changes"})
+# The write primitives. A success here changes the tree every other tool reads,
+# which is what makes a previously deterministic failure worth re-attempting.
+WORKSPACE_WRITE_TOOLS = frozenset({"apply_patch", "apply_changes"})
+IDEMPOTENCY_CACHE_ENTRIES = 64
+IDEMPOTENCY_KEY_MAX_LENGTH = 128
+# Command ids remembered only to keep one finished command from being counted
+# as a failed operation once per poll. Comfortably larger than the retained
+# command set, so a command cannot outlive its own ledger entry.
+COUNTED_OUTCOME_LEDGER_ENTRIES = 512
+REPEATED_CALL_BLOCKED = "REPEATED_CALL_BLOCKED"
+IDEMPOTENCY_KEY_REUSED = "IDEMPOTENCY_KEY_REUSED"
+IDEMPOTENCY_KEY_DESCRIPTION = (
+    "Names this exact request so a retry after a lost response replays the recorded result "
+    "(flagged idempotent_replay) instead of doing the work twice. Use a new key for new work: "
+    "the key is bound to the arguments that first used it, and reusing it with any other "
+    "argument — including a different dry_run — is refused with IDEMPOTENCY_KEY_REUSED. "
+    "Only a successful non-dry-run result is recorded, and only the "
+    f"{IDEMPOTENCY_CACHE_ENTRIES} most recently used keys are kept across all tools."
+)
 _COMMAND_RECOVERY_HINT = (
     "This command_id has expired or never existed; a finished command keeps its"
     f" output for {COMPLETED_COMMAND_TTL_SECONDS} seconds and only the last"
@@ -331,12 +380,36 @@ class ShellEnvPolicy:
     set: dict[str, str] = field(default_factory=dict)
 
 
+WORKSPACE_MUTATION_CHOICES = ("unrestricted", "structured-only")
+
+
+@dataclass(frozen=True)
+class WorkspaceMutationPolicy:
+    """Who may write to the workspace: the tools only, or commands too.
+
+    ``structured-only`` makes the workspace read-only for `exec_command` under
+    Landlock, leaving `apply_patch` and `apply_changes` as the only way in.
+    Every real project needs somewhere to put build output, so `write_paths`
+    is the escape hatch, and the default stays ``unrestricted`` because
+    defaulting this on would break pytest, npm, cargo, gradle, and git in one
+    release.
+    """
+
+    mode: str = "unrestricted"
+    write_paths: tuple[str, ...] = ()
+
+    @property
+    def structured_only(self) -> bool:
+        return self.mode == "structured-only"
+
+
 @dataclass(frozen=True)
 class RuntimePolicy:
     permission_mode: str
     shell_env_policy: ShellEnvPolicy
     allow_network: bool
     fake_readonly_annotations: bool = False
+    workspace_mutation: WorkspaceMutationPolicy = WorkspaceMutationPolicy()
 
 
 OAUTH_TOKEN_AUTH_METHODS = ("client_secret_basic", "client_secret_post", "none")
@@ -519,6 +592,25 @@ def fake_readonly_annotations_from_args(args: argparse.Namespace, permission_mod
     return requested
 
 
+def workspace_mutation_policy_from_args(args: argparse.Namespace) -> WorkspaceMutationPolicy:
+    raw_mode = (
+        getattr(args, "workspace_mutation", None)
+        or os.environ.get(f"{ENV_PREFIX}_WORKSPACE_MUTATION")
+        or "unrestricted"
+    )
+    mode = str(raw_mode).strip().lower()
+    if mode not in WORKSPACE_MUTATION_CHOICES:
+        supported = ", ".join(WORKSPACE_MUTATION_CHOICES)
+        raise ValueError(f"workspace mutation mode must be one of: {supported}")
+    raw_paths = list(getattr(args, "write_path", None) or ())
+    from_env = os.environ.get(f"{ENV_PREFIX}_WRITE_PATHS") or ""
+    raw_paths.extend(part for part in from_env.split(os.pathsep) if part.strip())
+    write_paths = tuple(dict.fromkeys(part.strip() for part in raw_paths if part.strip()))
+    if write_paths and mode != "structured-only":
+        raise ValueError("--write-path only applies with --workspace-mutation structured-only")
+    return WorkspaceMutationPolicy(mode=mode, write_paths=write_paths)
+
+
 def runtime_policy_from_args(args: argparse.Namespace) -> RuntimePolicy:
     permission_mode = permission_mode_from_args(args)
     allow_network = (
@@ -531,6 +623,7 @@ def runtime_policy_from_args(args: argparse.Namespace) -> RuntimePolicy:
         shell_env_policy=shell_env_policy_from_args(args),
         allow_network=allow_network,
         fake_readonly_annotations=fake_readonly_annotations_from_args(args, permission_mode),
+        workspace_mutation=workspace_mutation_policy_from_args(args),
     )
 
 
@@ -554,6 +647,90 @@ class ToolSpec:
     content_builder: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None
     gated_by: str | None = None
     """Name of a Runtime attribute that must be truthy for the tool to be exposed."""
+    callable_when_hidden: bool = False
+    """Whether a client that already knows the name may still call it when hidden.
+
+    A capability gate (``view_image``) means the tool cannot work, so a hidden
+    tool is an unknown tool. A mode gate means the tool works but can only ever
+    report one answer, so hiding it stops advertising a guaranteed failure
+    without breaking a client that calls it anyway.
+    """
+
+
+def _count_lines(text: str) -> int:
+    """Count file lines the way ``read_file`` reports ``total_lines``."""
+
+    return text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+
+
+def _patch_evidence(
+    content: str, changed_ranges: list[dict[str, int]], *, quality: str | None = None
+) -> dict[str, Any]:
+    """Post-edit evidence for one file: what the result is, not just that it worked.
+
+    ``revision`` is the same token ``read_file`` publishes and ``apply_changes``
+    requires, so a model can chain a structured edit onto a patch result
+    without re-reading the file.
+    """
+
+    evidence: dict[str, Any] = {
+        "revision": content_revision(content),
+        "total_lines": _count_lines(content),
+        "changed_ranges": changed_ranges,
+    }
+    if quality is not None:
+        evidence["match_quality"] = quality
+    return evidence
+
+
+def _whole_file_range(text: str) -> list[dict[str, int]]:
+    """The changed range for a file written in full."""
+
+    lines = _count_lines(text)
+    return [{"start_line": 1, "end_line": lines, "added_lines": lines, "removed_lines": 0}]
+
+
+def _merge_patch_affected_file(
+    affected: dict[str, dict[str, Any]], entry: dict[str, Any]
+) -> None:
+    """Keep one final evidence record per resolved path.
+
+    Same-path update blocks chain through intermediate staged bytes, but only
+    the last bytes are ever committed. Merge placement quality here; once a
+    chain is complete, the caller replaces block-local ranges with a diff from
+    the original baseline to the final staged content.
+    """
+
+    path = str(entry["path"])
+    previous = affected.get(path)
+    if previous is None:
+        affected[path] = entry
+        return
+    merged = dict(entry)
+    if entry.get("operation") == "delete":
+        # A deleted file has no final text whose placement quality could be
+        # inspected. Do not leak evidence from an earlier staged update.
+        merged.pop("match_quality", None)
+        affected[path] = merged
+        return
+    else:
+        previous_ranges = previous.get("changed_ranges")
+        current_ranges = entry.get("changed_ranges")
+        merged["changed_ranges"] = [
+            *(previous_ranges if isinstance(previous_ranges, list) else []),
+            *(current_ranges if isinstance(current_ranges, list) else []),
+        ]
+    if merged.get("operation") == "unchanged" and previous.get("operation") != "unchanged":
+        merged["operation"] = previous["operation"]
+    quality_order = {"exact": 0, "trailing_ws": 1, "indent": 2}
+    previous_quality = previous.get("match_quality")
+    current_quality = merged.get("match_quality")
+    if (
+        isinstance(previous_quality, str)
+        and quality_order.get(previous_quality, -1) > quality_order.get(str(current_quality), -1)
+    ):
+        merged["match_quality"] = previous_quality
+    affected[path] = merged
 
 
 def _image_content(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -607,8 +784,32 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     "apply_patch": ToolSpec(
         title="Apply patch",
         description=(
-            "Stage, validate, and atomically apply a patch envelope. Example: "
+            "Stage, validate, and atomically apply a V4A patch envelope. Each hunk locates itself by "
+            "its context, so the context must be unique in the file; when it is not, add a scope header "
+            "(@@ def my_function) naming the enclosing block, or add '*** End of File' to anchor the hunk "
+            "at the end. A blank context line may be written as \"\" or as a single space. Matching is "
+            "graded exact, then ignoring trailing whitespace, then ignoring indentation width, and the "
+            "grade actually used comes back as match_quality. Success returns each file's revision, "
+            "total_lines, and changed_ranges. Several updates to one path in one envelope chain in order. "
+            "Full format reference: docs/tools-and-schemas.md. Example: "
             "*** Begin Patch\n*** Update File: app.py\n@@\n-old\n+new\n*** End Patch"
+        ),
+        destructive=True,
+    ),
+    "apply_changes": ToolSpec(
+        title="Apply changes",
+        description=(
+            "Apply line-addressed file changes atomically. Prefer this over apply_patch when you know "
+            "the line numbers: nothing has to match. Each change names an action (create, write, edit, "
+            "delete, move, copy), and a path. write is an upsert: it needs the revision read_file reported "
+            "when the path exists, but may omit it when creating a missing path. edit, delete, move, and "
+            "copy always need that revision; create rejects it and asserts absence. edit takes line "
+            "operations (replace, delete, insert_after, insert_before) whose numbers all refer to the "
+            "file as read, not to the result of earlier edits in the same call. content is whole lines: "
+            "\"\" is zero lines and a trailing newline adds a blank line. One path per call; use "
+            "apply_patch to chain several edits onto one file. Example: {\"changes\":[{\"action\":\"edit\","
+            "\"path\":\"app.py\",\"revision\":\"<from read_file>\",\"edits\":[{\"op\":\"replace\","
+            "\"start_line\":10,\"end_line\":12,\"content\":\"new line\"}]}]}"
         ),
         destructive=True,
     ),
@@ -616,7 +817,9 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         title="Execute command",
         description=(
             "Run a bounded command under runtime policy. Pass workdir explicitly for reconnect-safe paths. "
-            "A still-running command returns command_id. Example: "
+            "yield_time_ms is only how long this call waits (default 10s); timeout_ms is the total process "
+            "lifetime (default 300s). A command still running when the call returns keeps running under its "
+            "command_id; poll it with write_stdin or read_output. Example: "
             "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000}. "
             "Retained output is bounded per stream; for very large output redirect to a file "
             "(cmd > out.log 2>&1) and page it with read_file or search_text."
@@ -659,7 +862,10 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     ),
     "git_diff": ToolSpec(
         title="Git diff",
-        description="Return unified git diff for workspace changes.",
+        description=(
+            "Return unified git diff for workspace changes. Untracked files are included as "
+            "additions by default, so a newly created file is verifiable here."
+        ),
         read_only=True,
         idempotent=True,
     ),
@@ -683,8 +889,14 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     ),
     "request_permissions": ToolSpec(
         title="Request permissions",
-        description="Report scoped permission-request status without silently granting operations.",
+        description=(
+            "Report scoped permission-request status without silently granting operations. "
+            "Advertised only in permission_mode=dangerous, the sole configuration in which it can "
+            "return granted; elsewhere it can only ever return ELICITATION_UNSUPPORTED."
+        ),
         read_only=True,
+        gated_by="dangerously_skip_all_permissions",
+        callable_when_hidden=True,
     ),
     "view_image": ToolSpec(
         title="View image",
@@ -1276,17 +1488,21 @@ class Runtime:
         oauth_config: OAuthConfig | None = None,
         project_context: ProjectContext | None = None,
         fake_readonly_annotations: bool = False,
+        workspace_mutation: WorkspaceMutationPolicy | None = None,
         transport: str = "stdio",
         command_manager: WorkspaceCommandManager | None = None,
     ) -> None:
         self.workspace = Workspace(workspace)
+        self.workspace_mutation = workspace_mutation or WorkspaceMutationPolicy()
+        if self.workspace_mutation.mode not in WORKSPACE_MUTATION_CHOICES:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                f"Unknown workspace mutation mode: {self.workspace_mutation.mode}",
+                category="validation",
+                details={"supported": list(WORKSPACE_MUTATION_CHOICES)},
+            )
+        self._workspace_write_path_roots = tuple(self._resolve_workspace_write_paths())
         self.enable_view_image = enable_view_image
-        self._exposed_tool_names = [
-            name
-            for name, spec in TOOL_REGISTRY.items()
-            if spec.gated_by is None or getattr(self, spec.gated_by)
-        ]
-        self._exposed_tool_name_set = frozenset(self._exposed_tool_names)
         if permission_mode not in PERMISSION_MODE_CHOICES:
             raise ToolFailure(
                 "INVALID_ARGUMENT",
@@ -1297,6 +1513,14 @@ class Runtime:
         self.permission_mode = permission_mode
         self.capabilities = PERMISSION_MODE_CAPABILITIES[permission_mode]
         self.dangerously_skip_all_permissions = self.capabilities.skip_all_permissions
+        # Computed after the permission mode resolves: `gated_by` names a
+        # runtime property, and one of the gates is the permission mode.
+        self._exposed_tool_names = [
+            name
+            for name, spec in TOOL_REGISTRY.items()
+            if spec.gated_by is None or getattr(self, spec.gated_by)
+        ]
+        self._exposed_tool_name_set = frozenset(self._exposed_tool_names)
         # Faking annotations is only defensible where the caller has already
         # asserted the workspace is disposable, so bind it to that assertion
         # instead of letting it be set orthogonally.
@@ -1336,6 +1560,26 @@ class Runtime:
         self.patch_baselines: dict[str, str | None] = {}
         self.patch_lock = threading.Lock()
         self.patch_committer = AtomicPatchCommitter()
+        self._idempotency_results: OrderedDict[tuple[str, str], tuple[str, dict[str, Any]]] = OrderedDict()
+        self._idempotency_lock = threading.Lock()
+        self._idempotency_condition = threading.Condition(self._idempotency_lock)
+        self._idempotency_inflight: set[tuple[str, str]] = set()
+        # Every keyed caller pins its cache slot before it either executes or
+        # waits. A completed owner may wake after enough unrelated completions
+        # to overflow the LRU; retaining the slot until all registered waiters
+        # drain guarantees they replay the result instead of executing twice.
+        self._idempotency_pins: dict[tuple[str, str], int] = {}
+        # Command ids whose terminal outcome telemetry has already counted. A
+        # finished command answers every later poll with the same outcome, so
+        # without this one failing build is counted once per poll. The outcome
+        # is always assigned to exec_command, which owns the command.
+        self._counted_command_outcomes: OrderedDict[str, None] = OrderedDict()
+        self._counted_outcomes_lock = threading.Lock()
+        # Terminal command results can also invalidate breaker verdicts, but
+        # re-reading retained output must not invalidate them again.
+        self._breaker_reset_commands: OrderedDict[str, None] = OrderedDict()
+        self._breaker_reset_commands_lock = threading.Lock()
+        self.breaker = RepeatFailureBreaker()
         # ProjectContext is frozen and derived only from the workspace tree, so
         # an embedder that builds several runtimes over one workspace can reuse
         # the discovery (git ls-files / directory walk) result.
@@ -1453,7 +1697,121 @@ class Runtime:
         return self.capabilities.landlock
 
     def landlock_write_roots(self) -> list[Path]:
-        return [self.runtime_dir]
+        roots = [self.runtime_dir]
+        if self.workspace_mutation.structured_only:
+            roots.extend(self._ensure_workspace_write_paths())
+        return roots
+
+    def _resolve_workspace_write_paths(self) -> list[Path]:
+        """Resolve and validate the configured workspace write allowlist.
+
+        A write path that escapes the workspace would widen the sandbox past
+        the boundary every other tool enforces, so it is dropped rather than
+        honoured. Resolution is deliberately side-effect free: reporting tools
+        must not create directories merely by describing the policy.
+        """
+
+        resolved: list[Path] = []
+        for entry in self.workspace_mutation.write_paths:
+            candidate = Path(entry)
+            absolute = candidate if candidate.is_absolute() else self.workspace.root / candidate
+            try:
+                real = absolute.resolve(strict=False)
+            except OSError:
+                continue
+            if is_relative_to(real, self.workspace.root):
+                existing = real
+                while not existing.exists() and existing != self.workspace.root:
+                    existing = existing.parent
+                if existing.exists() and not existing.is_dir():
+                    raise ToolFailure(
+                        "INVALID_ARGUMENT",
+                        f"Configured write path is not a directory: {entry}",
+                        category="validation",
+                        details={"path": entry},
+                    )
+                resolved.append(real)
+        return resolved
+
+    def workspace_write_paths(self) -> list[Path]:
+        """Return the validated allowlist without mutating the workspace."""
+
+        return list(self._workspace_write_path_roots)
+
+    def _ensure_workspace_write_paths(self) -> list[Path]:
+        """Create allowlisted directories immediately before Landlock uses them."""
+
+        for path in self._workspace_write_path_roots:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                display = normalize_rel_display(path, self.workspace.root)
+                if exc.errno in {errno.EEXIST, errno.ENOTDIR}:
+                    raise ToolFailure(
+                        "INVALID_ARGUMENT",
+                        f"Configured write path is not a directory: {display}",
+                        category="validation",
+                        details={"path": display},
+                    ) from exc
+                raise ToolFailure(
+                    "SANDBOX_UNAVAILABLE",
+                    f"Configured write path could not be created: {display}",
+                    category="security",
+                    details={
+                        "path": display,
+                        "errno": exc.errno,
+                        "reason": exc.strerror or str(exc),
+                    },
+                ) from exc
+            if not path.is_dir():
+                display = normalize_rel_display(path, self.workspace.root)
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    f"Configured write path is not a directory: {display}",
+                    category="validation",
+                    details={"path": display},
+                )
+        return self.workspace_write_paths()
+
+    def workspace_mutation_payload(self) -> dict[str, Any]:
+        """Disclose who may write to the workspace, and whether it is enforced.
+
+        `structured-only` is enforced by Landlock ABI 3 or newer. Older ABIs
+        cannot mediate truncate, so calling them enforced would promise more
+        than the kernel can provide.
+        """
+
+        landlock = landlock_status_payload()
+        abi = landlock.get("abi_version")
+        truncate_protected = isinstance(abi, int) and abi >= 3
+        enforced = (
+            self.workspace_mutation.structured_only
+            and self.landlock_enabled()
+            and bool(landlock.get("available"))
+            and truncate_protected
+        )
+        warnings: list[str] = []
+        if self.workspace_mutation.structured_only and not enforced:
+            if bool(landlock.get("available")) and self.landlock_enabled() and not truncate_protected:
+                warnings.append(
+                    "workspace_mutation=structured-only requires Landlock ABI 3 or newer; "
+                    f"ABI {abi} cannot deny file truncation, so the policy is not fully enforced"
+                )
+            else:
+                warnings.append(
+                    "workspace_mutation=structured-only is not enforced without enabled Landlock; "
+                    "exec_command can still write to the workspace"
+                )
+        return {
+            "mode": self.workspace_mutation.mode,
+            "write_paths": [
+                normalize_rel_display(path, self.workspace.root) for path in self.workspace_write_paths()
+            ],
+            "enforced": enforced if self.workspace_mutation.structured_only else True,
+            "enforced_by": "landlock" if enforced else "none",
+            "structured_write_tools": sorted(WORKSPACE_WRITE_TOOLS),
+            "warnings": warnings,
+        }
 
     def is_allowed_command_tmp_path(self, candidate: str) -> bool:
         if self.capabilities.skip_all_permissions:
@@ -1579,6 +1937,7 @@ class Runtime:
                 "global_tmp_write": self.global_tmp_write_policy(),
                 "secret_env_filter": self.secret_env_filter_policy(),
             },
+            "workspace_mutation_policy": self.workspace_mutation_payload(),
             "shell_env_inherit": self.shell_env_policy.inherit,
             "shell_env_include_only": list(self.shell_env_policy.include_only),
             "shell_env_exclude": list(self.shell_env_policy.exclude),
@@ -1588,6 +1947,8 @@ class Runtime:
             "output_retention": {
                 "buffer_bytes_per_stream": COMMAND_BUFFER_BYTES,
                 "head_bytes_per_stream": COMMAND_BUFFER_BYTES // COMMAND_HEAD_BUFFER_DIVISOR,
+                "completed_command_ttl_seconds": COMPLETED_COMMAND_TTL_SECONDS,
+                "max_retained_completed_commands": MAX_RETAINED_OUTPUT_COMMANDS,
             },
             "endpoint_path": MCP_ENDPOINT_PATH,
             "project_context": {
@@ -1608,14 +1969,42 @@ class Runtime:
     ) -> dict[str, Any]:
         started_at = time.time()
         args = arguments or {}
-        handler = self._tool_handlers.get(name) if name in self._exposed_tool_name_set else None
+        handler = self._tool_handlers.get(name) if self._is_callable_tool(name) else None
         if handler is None:
             raise JsonRpcError(-32602, f"Unknown tool: {name}", {"reason": "unknown_tool"})
         spec = TOOL_REGISTRY[name]
         validate_arguments(name, args)
+        fingerprint = argument_fingerprint(args)
+        idempotency_slot = self._idempotency_slot(name, args)
+        self._begin_idempotent_call(idempotency_slot)
+        breaker_generation = self.breaker.generation
         try:
+            # Inside the try: a key reused for different work is a tool error
+            # the model can act on, not an exception that escapes the envelope.
+            replayed = self._recorded_result(idempotency_slot, fingerprint)
+            if replayed is not None:
+                self.emit_tool_trace(name, args, replayed, started_at, context=context)
+                content = spec.content_builder(dict(replayed)) if spec.content_builder else None
+                return make_tool_result(name, replayed, is_error=replayed.get("ok") is False, content=content)
+            blocked = self.breaker.blocked_error_code(name, fingerprint)
+            if blocked is not None:
+                raise self._repeat_failure_error(name, blocked)
             payload = handler(args)
             payload.setdefault("ok", True)
+            if payload.get("ok") is False:
+                self._record_breaker_failure(name, fingerprint, payload, breaker_generation)
+                self.emit_tool_trace(name, args, payload, started_at, context=context)
+                content = spec.content_builder(payload) if spec.content_builder else None
+                return make_tool_result(name, payload, is_error=True, content=content)
+            self.breaker.record_success(name, fingerprint, generation=breaker_generation)
+            if self._workspace_write_landed(name, payload):
+                # A write landed, so every "this call can never succeed"
+                # verdict the breaker holds was reached against a tree that no
+                # longer exists.
+                self.breaker.reset()
+            else:
+                self._reset_breaker_after_terminal_command(payload)
+            self._record_result(idempotency_slot, fingerprint, payload)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             content = spec.content_builder(payload) if spec.content_builder else None
             return make_tool_result(name, payload, is_error=payload.get("ok") is False, content=content)
@@ -1645,6 +2034,7 @@ class Runtime:
                 }
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
+            self._record_breaker_failure(name, fingerprint, payload, breaker_generation)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
         except Exception as exc:  # noqa: BLE001 - tool failures must stay structured
@@ -1660,8 +2050,198 @@ class Runtime:
             }
             if spec.error_status:
                 payload["status"] = spec.error_status
+            self._record_breaker_failure(name, fingerprint, payload, breaker_generation)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
+        finally:
+            self._finish_idempotent_call(idempotency_slot)
+
+    def _record_breaker_failure(
+        self,
+        name: str,
+        fingerprint: str,
+        payload: dict[str, Any],
+        generation: int,
+    ) -> None:
+        """Count a structured failure whether returned or raised by a handler."""
+
+        raw_error = payload.get("error")
+        error = raw_error if isinstance(raw_error, dict) else {}
+        code = str(error.get("code") or "INTERNAL_ERROR")
+        if code == REPEATED_CALL_BLOCKED:
+            return
+        repeats = self.breaker.record_failure(
+            name,
+            fingerprint,
+            error_code=code,
+            retryable=bool(error.get("retryable")),
+            generation=generation,
+        )
+        if repeats >= self.breaker.limit:
+            raw_details = error.get("details")
+            details = raw_details if isinstance(raw_details, dict) else {}
+            error["details"] = {
+                **details,
+                "consecutive_identical_failures": repeats,
+                "breaker": (
+                    f"This exact call has now failed {repeats} times. "
+                    "Repeating it unchanged will be refused."
+                ),
+            }
+
+    def _is_callable_tool(self, name: str) -> bool:
+        if name in self._exposed_tool_name_set:
+            return True
+        spec = TOOL_REGISTRY.get(name)
+        # A mode-gated tool disappears from tools/list but keeps answering a
+        # client that already knows about it, so removing it from the catalog
+        # never turns a working call into "unknown tool".
+        return spec is not None and spec.callable_when_hidden
+
+    def _repeat_failure_error(self, name: str, error_code: str) -> ToolFailure:
+        return ToolFailure(
+            REPEATED_CALL_BLOCKED,
+            (
+                f"This exact {name} call already failed {self.breaker.limit} times with {error_code}"
+                " and is refused until its arguments change."
+            ),
+            category="validation",
+            retryable=False,
+            details={
+                "tool": name,
+                "error_code": error_code,
+                "attempts": self.breaker.limit,
+                "retry_hint": (
+                    "Do not resend these arguments. Read the current state (read_file, git_status,"
+                    " list_dir) and construct a different call."
+                ),
+            },
+        )
+
+    def _idempotency_slot(self, name: str, args: dict[str, Any]) -> tuple[str, str] | None:
+        if name not in IDEMPOTENT_TOOLS:
+            return None
+        raw = args.get("idempotency_key")
+        return (name, raw) if isinstance(raw, str) and raw else None
+
+    def _begin_idempotent_call(self, slot: tuple[str, str] | None) -> None:
+        """Take the execution turn for one keyed request.
+
+        Looking in the completed-result cache is not enough: two callers can
+        both miss before either has recorded its result. Keep the slot occupied
+        through execution and recording so every waiter rechecks the cache
+        after the first call has made its mutation durable.
+        """
+
+        if slot is None:
+            return
+        with self._idempotency_condition:
+            self._idempotency_pins[slot] = self._idempotency_pins.get(slot, 0) + 1
+            try:
+                while slot in self._idempotency_inflight:
+                    self._idempotency_condition.wait()
+                self._idempotency_inflight.add(slot)
+            except BaseException:
+                self._unpin_idempotency_slot_locked(slot)
+                raise
+
+    def _finish_idempotent_call(self, slot: tuple[str, str] | None) -> None:
+        if slot is None:
+            return
+        with self._idempotency_condition:
+            self._idempotency_inflight.discard(slot)
+            self._unpin_idempotency_slot_locked(slot)
+            self._prune_idempotency_results_locked()
+            self._idempotency_condition.notify_all()
+
+    def _unpin_idempotency_slot_locked(self, slot: tuple[str, str]) -> None:
+        remaining = self._idempotency_pins.get(slot, 0) - 1
+        if remaining > 0:
+            self._idempotency_pins[slot] = remaining
+        else:
+            self._idempotency_pins.pop(slot, None)
+
+    def _prune_idempotency_results_locked(self) -> None:
+        while len(self._idempotency_results) > IDEMPOTENCY_CACHE_ENTRIES:
+            victim = next(
+                (candidate for candidate in self._idempotency_results if candidate not in self._idempotency_pins),
+                None,
+            )
+            if victim is None:
+                # A short-lived overflow is safer than evicting a result a
+                # waiter has already been promised. The final waiter prunes it.
+                return
+            del self._idempotency_results[victim]
+
+    def _recorded_result(self, slot: tuple[str, str] | None, fingerprint: str) -> dict[str, Any] | None:
+        """Return the result a previous call under this key produced, if any.
+
+        A key stands for one piece of work, so the recorded result is only
+        replayed for the arguments that produced it. Reusing a key for a
+        different request is answered with an error rather than with the first
+        request's success, which would report work that was never done.
+        """
+
+        if slot is None:
+            return None
+        with self._idempotency_lock:
+            recorded = self._idempotency_results.get(slot)
+            if recorded is None:
+                return None
+            self._idempotency_results.move_to_end(slot)
+        recorded_fingerprint, payload = recorded
+        if recorded_fingerprint != fingerprint:
+            raise ToolFailure(
+                IDEMPOTENCY_KEY_REUSED,
+                f"idempotency_key {slot[1]!r} was already used by a different {slot[0]} request. "
+                "A key names one request: replay it with the same arguments, or send a new key.",
+                category="validation",
+                retryable=False,
+                details={
+                    "tool": slot[0],
+                    "idempotency_key": slot[1],
+                    "retry_hint": "Resend the original arguments to replay, or choose a new idempotency_key.",
+                },
+            )
+        replay = dict(payload)
+        replay["idempotent_replay"] = True
+        return replay
+
+    def _record_result(self, slot: tuple[str, str] | None, fingerprint: str, payload: dict[str, Any]) -> None:
+        """Record one success under its key, with the arguments that earned it.
+
+        A failure is never recorded: it carries its own retryability, and
+        replaying one would turn a transient conflict into a permanent answer
+        for as long as the key is reused. A dry run is never recorded either —
+        it changed nothing, so answering a later real apply with it would
+        report a write that never happened.
+        """
+
+        if slot is None or payload.get("ok") is False or payload.get("dry_run"):
+            return
+        with self._idempotency_lock:
+            self._idempotency_results[slot] = (fingerprint, dict(payload))
+            self._idempotency_results.move_to_end(slot)
+            self._prune_idempotency_results_locked()
+
+    @staticmethod
+    def _workspace_write_landed(name: str, payload: dict[str, Any]) -> bool:
+        """Whether a structured write tool changed the workspace's net state."""
+
+        if name not in WORKSPACE_WRITE_TOOLS or any(
+            payload.get(flag) for flag in ("dry_run", "already_applied", "idempotent_replay")
+        ):
+            return False
+        affected = payload.get("affected_files")
+        if not isinstance(affected, list):
+            return False
+        non_mutating_operations = {"unchanged", "verify"}
+        operations = [
+            entry.get("operation")
+            for entry in affected
+            if isinstance(entry, dict) and isinstance(entry.get("operation"), str)
+        ]
+        return any(operation not in non_mutating_operations for operation in operations)
 
     def server_info(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.server_info_payload()
@@ -1669,8 +2249,18 @@ class Runtime:
     def check_exec_environment(self, args: dict[str, Any]) -> dict[str, Any]:
         landlock = landlock_status_payload()
         warnings: list[str] = []
+        # Landlock is the only filesystem confinement this server has, and it is
+        # Linux-only. Elsewhere a command runs with the whole user account's
+        # reach, which callers must be told rather than left to infer.
+        if sys.platform != "linux":
+            warnings.append(
+                f"platform {sys.platform} has no filesystem confinement for exec_command; "
+                "commands run with full user privileges outside the workspace"
+            )
         if not landlock.get("available"):
             warnings.append("Linux Landlock filesystem confinement is unavailable")
+        mutation = self.workspace_mutation_payload()
+        warnings.extend(str(item) for item in mutation.get("warnings", []))
         if self.capabilities.skip_all_permissions:
             warnings.append("permission_mode=dangerous disables MCP safety gates")
         if self.fake_readonly_annotations:
@@ -1683,6 +2273,7 @@ class Runtime:
             "landlock_enabled": self._landlock_enforced(landlock),
             "landlock_abi": landlock.get("abi_version"),
             "global_tmp_write": self.global_tmp_write_policy(),
+            "workspace_mutation_policy": mutation,
             "warnings": warnings,
         }
 
@@ -1698,6 +2289,8 @@ class Runtime:
         raw_error = payload.get("error")
         error = raw_error if isinstance(raw_error, dict) else {}
         duration_ms = int((time.time() - started_at) * 1000)
+        raw_outcome = payload.get("operation_outcome")
+        outcome = self._countable_outcome(name, payload)
         # `context` is passed on as the opaque per-request fact it is: the
         # runtime neither reads the client identity in it nor branches on it.
         self.telemetry.record_tool_call(
@@ -1707,6 +2300,7 @@ class Runtime:
             duration_ms=duration_ms,
             truncated=bool(payload.get("truncated")),
             context=context,
+            outcome=outcome,
         )
         if os.environ.get(f"{ENV_PREFIX}_TRACE") != "1":
             return
@@ -1716,6 +2310,7 @@ class Runtime:
             "tool": name,
             "ok": bool(payload.get("ok", False)),
             "status": payload.get("status"),
+            "operation_outcome": raw_outcome if isinstance(raw_outcome, str) else None,
             "error_code": error.get("code"),
             "duration_ms": duration_ms,
             "command_id": payload.get("command_id"),
@@ -1723,6 +2318,71 @@ class Runtime:
             "args": redact_for_trace(args),
         }
         print(json.dumps(event, sort_keys=True, separators=(",", ":")), file=sys.stderr, flush=True)
+
+    def _reset_breaker_after_terminal_command(self, payload: dict[str, Any]) -> None:
+        """Invalidate stale verdicts once when a command could have written."""
+
+        outcome = payload.get("operation_outcome")
+        if outcome not in set(COMMAND_OUTCOMES) - {"running", "spawn_error"}:
+            return
+        command_id = payload.get("command_id")
+        if not isinstance(command_id, str) or not command_id:
+            return
+        with self.commands_lock:
+            command = self.commands.get(command_id) or self.output_commands.get(command_id)
+        if command is not None:
+            # This launch-specific fact handles a Landlock ruleset install
+            # that failed open even when the host still advertises support.
+            commands_may_write = command.workspace_may_write
+        else:
+            # Synthetic/embedder-provided command payloads have no retained
+            # CommandRun. Conservatively fall back to the advertised policy.
+            mutation = self.workspace_mutation_payload()
+            commands_may_write = (
+                not self.workspace_mutation.structured_only
+                or mutation.get("enforced") is not True
+                or bool(self._workspace_write_path_roots)
+            )
+        if not commands_may_write:
+            return
+        with self._breaker_reset_commands_lock:
+            if command_id in self._breaker_reset_commands:
+                return
+            self._breaker_reset_commands[command_id] = None
+            while len(self._breaker_reset_commands) > COUNTED_OUTCOME_LEDGER_ENTRIES:
+                self._breaker_reset_commands.popitem(last=False)
+            self.breaker.reset()
+
+    def _countable_outcome(self, observer: str, payload: dict[str, Any]) -> str | None:
+        """Return the operation outcome telemetry should count for this call.
+
+        A terminal outcome belongs to the ``exec_command`` call that started
+        the command, not to whichever polling tool first observed it. Every
+        later observer reports that same outcome again, so the command id is
+        claimed once. When a poll wins the claim, its own successful call is
+        recorded without the command outcome and the outcome is attached to
+        the earlier ``exec_command`` summary. ``running`` remains an
+        observation of the current call and is never claimed.
+        """
+
+        outcome = payload.get("operation_outcome")
+        if not isinstance(outcome, str):
+            return None
+        if outcome == "running":
+            return outcome
+        command_id = payload.get("command_id")
+        if not isinstance(command_id, str) or not command_id:
+            return outcome
+        with self._counted_outcomes_lock:
+            if command_id in self._counted_command_outcomes:
+                return None
+            self._counted_command_outcomes[command_id] = None
+            while len(self._counted_command_outcomes) > COUNTED_OUTCOME_LEDGER_ENTRIES:
+                self._counted_command_outcomes.popitem(last=False)
+        if observer != "exec_command":
+            self.telemetry.record_deferred_operation_outcome("exec_command", outcome)
+            return None
+        return outcome
 
     def read_file(self, args: dict[str, Any]) -> dict[str, Any]:
         requested_path = str(args.get("path", ""))
@@ -1753,9 +2413,15 @@ class Runtime:
         selected_bytes = 0
         total_lines = 0
         selection_complete = False
+        # The revision is folded into the pass that already walks every line,
+        # so it names the bytes this call decoded rather than whatever a second
+        # open would have found a moment later.
+        digest = hashlib.sha256()
         try:
             with resolved.path.open("r", encoding="utf-8", errors="strict", newline="") as handle:
                 for total_lines, line in enumerate(handle, start=1):
+                    line_bytes = line.encode("utf-8")
+                    digest.update(line_bytes)
                     if total_lines < start_line:
                         continue
                     if requested_end is not None and total_lines > requested_end:
@@ -1763,7 +2429,7 @@ class Runtime:
                     if selection_complete:
                         continue
                     selected_parts.append(line)
-                    selected_bytes += len(line.encode("utf-8"))
+                    selected_bytes += len(line_bytes)
                     if len(selected_parts) > DEFAULT_MAX_LINES or selected_bytes > max_bytes:
                         selection_complete = True
         except UnicodeDecodeError as exc:
@@ -1788,6 +2454,8 @@ class Runtime:
             "path": resolved.display,
             "content": selected,
             "encoding": "utf-8",
+            "revision": digest.hexdigest(),
+            "revision_algorithm": REVISION_ALGORITHM,
             "max_bytes": max_bytes,
             "start_line": start_line,
             "end_line": actual_end,
@@ -2235,7 +2903,9 @@ class Runtime:
             operations = parse_patch(patch)
             staged: dict[str, StagedFile] = {}
             summaries: list[str] = []
-            affected: list[dict[str, str]] = []
+            affected: dict[str, dict[str, Any]] = {}
+            warnings: list[str] = []
+            already_applied_operations = 0
             additions = 0
             removals = 0
             for op in operations:
@@ -2257,17 +2927,30 @@ class Runtime:
                         baseline,
                         None,
                     )
-                    affected.append({"path": target.display, "operation": "add"})
+                    added_text = op.add_content or ""
+                    _merge_patch_affected_file(
+                        affected,
+                        {
+                            "path": target.display,
+                            "operation": "add",
+                            **_patch_evidence(added_text, _whole_file_range(added_text)),
+                        },
+                    )
                     summaries.append(f"A {target.display}")
-                    additions += len((op.add_content or "").splitlines())
+                    additions += len(added_text.splitlines())
                 elif op.kind == "delete":
                     target = self.workspace.resolve_existing(op.path)
                     if target.path.is_dir():
                         raise ToolFailure("PATCH_FAILED", "Cannot delete a directory.", category="validation")
                     prior = staged.get(target.display)
                     baseline = prior.baseline if prior is not None else FileBaseline.capture(target.path)
-                    staged[target.display] = StagedFile(target.display, target.path, None, baseline, baseline.mode)
-                    affected.append({"path": target.display, "operation": "delete"})
+                    staged[target.display] = StagedFile(
+                        target.display, target.path, None, baseline, baseline.mode, action="delete"
+                    )
+                    _merge_patch_affected_file(
+                        affected,
+                        {"path": target.display, "operation": "delete", "total_lines": 0},
+                    )
                     summaries.append(f"D {target.display}")
                     removals += len((baseline.data or b"").splitlines())
                 elif op.kind == "update":
@@ -2280,16 +2963,26 @@ class Runtime:
                     baseline = prior.baseline if prior is not None else FileBaseline.capture(source.path)
                     content = prior.content if prior is not None else baseline.text(source.display)
                     assert content is not None
-                    updated = apply_update_hunks(content, op.hunks, op.path)
+                    outcome = apply_update_hunks_detailed(content, op.hunks, op.path)
+                    updated = outcome.content
+                    warnings.extend(f"{source.display}: {item}" for item in outcome.warnings)
+                    operation_already_applied = (
+                        outcome.applied_hunks == 0 and bool(outcome.already_applied_hunks)
+                    )
                     for hunk in op.hunks:
-                        for line in hunk:
+                        for line in hunk.lines:
                             additions += line.startswith("+")
                             removals += line.startswith("-")
+                    evidence = _patch_evidence(updated, outcome.changed_ranges, quality=outcome.match_quality)
                     source_mode = prior.mode if prior is not None else baseline.mode
                     if op.move_to:
                         dest = self.workspace.resolve_for_write(op.move_to)
                         if dest.existed and dest.display != source.display:
                             raise ToolFailure("PATCH_FAILED", "Cannot move over an existing file.", category="validation")
+                        # Already-matching hunks make the content update a
+                        # no-op, but relocating the file is still a write.
+                        if operation_already_applied and dest.display == source.display:
+                            already_applied_operations += 1
                         dest_baseline = baseline if dest.display == source.display else FileBaseline.capture(dest.path)
                         staged[source.display] = StagedFile(
                             source.display,
@@ -2305,18 +2998,63 @@ class Runtime:
                             dest_baseline,
                             source_mode,
                         )
-                        affected.append({"path": dest.display, "old_path": source.display, "operation": "move"})
+                        if prior is not None and dest.display != source.display:
+                            # Earlier blocks named the source, but only the
+                            # destination exists after this chain commits.
+                            previous_entry = affected.pop(source.display, None)
+                            if previous_entry is not None:
+                                affected[dest.display] = {
+                                    **previous_entry,
+                                    "path": dest.display,
+                                }
+                        _merge_patch_affected_file(
+                            affected,
+                            {
+                                "path": dest.display,
+                                "old_path": source.display,
+                                "operation": "move",
+                                **evidence,
+                            },
+                        )
+                        if prior is not None:
+                            affected[dest.display]["changed_ranges"] = changed_ranges_between(
+                                baseline.text(source.display), updated
+                            )
                         summaries.append(f"R {source.display} -> {dest.display}")
                     else:
+                        if operation_already_applied:
+                            already_applied_operations += 1
+                        # The final staged bytes, rather than only this block's
+                        # input, decide whether a write is necessary. A chain
+                        # of already-applied blocks, or a later block that
+                        # returns an earlier edit to the original bytes, must
+                        # remain a baseline assertion and preserve the mtime.
+                        block_unchanged = updated == content
+                        baseline_content = baseline.text(source.display)
+                        net_unchanged = updated == baseline_content
                         staged[source.display] = StagedFile(
                             source.display,
                             source.path,
                             updated,
                             baseline,
                             source_mode,
+                            action="verify" if net_unchanged else "write",
                         )
-                        affected.append({"path": source.display, "operation": "update"})
-                        summaries.append(f"M {source.display}")
+                        _merge_patch_affected_file(
+                            affected,
+                            {
+                                "path": source.display,
+                                "operation": "unchanged" if net_unchanged else "update",
+                                **evidence,
+                            },
+                        )
+                        if prior is not None:
+                            net_ranges = changed_ranges_between(baseline_content, updated)
+                            affected[source.display]["changed_ranges"] = net_ranges
+                            affected[source.display]["operation"] = (
+                                "unchanged" if net_unchanged else "update"
+                            )
+                        summaries.append(f"{'=' if block_unchanged else 'M'} {source.display}")
             if not affected:
                 raise ToolFailure("PATCH_FAILED", "No files were modified.", category="validation")
             if not dry_run:
@@ -2324,18 +3062,256 @@ class Runtime:
         return {
             "dry_run": dry_run,
             "clean": True,
+            "already_applied": (
+                already_applied_operations > 0
+                and already_applied_operations == len(operations)
+            ),
+            "revision_algorithm": REVISION_ALGORITHM,
+            "summary": "\n".join(summaries),
+            "affected_files": list(affected.values()),
+            "additions": additions,
+            "removals": removals,
+            "warnings": warnings,
+        }
+
+    def apply_changes(self, args: dict[str, Any]) -> dict[str, Any]:
+        dry_run = bool(args.get("dry_run", False))
+        changes = parse_changes(args.get("changes"))
+        staged: dict[str, StagedFile] = {}
+        summaries: list[str] = []
+        affected: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        additions = 0
+        removals = 0
+        unchanged_files = 0
+        with self.patch_lock:
+            # Every path in the array is resolved before anything is staged, so
+            # a rejected path in the last change cannot leave the earlier ones
+            # half prepared, and so the duplicate check below compares the
+            # names staging will actually use.
+            targets: list[tuple[int, str]] = []
+            for change in changes:
+                targets.extend(self._resolve_change_paths(change))
+            reject_duplicate_paths(targets)
+            for change in changes:
+                if change.action in {"create", "write"}:
+                    result = self._stage_written_file(change, staged)
+                elif change.action == "edit":
+                    result = self._stage_edited_file(change, staged)
+                elif change.action == "delete":
+                    result = self._stage_deleted_file(change, staged)
+                else:
+                    result = self._stage_relocated_file(change, staged)
+                entry, summary, added, removed = result
+                affected.append(entry)
+                summaries.append(summary)
+                additions += added
+                removals += removed
+                unchanged_files += entry["operation"] == "unchanged"
+            if not affected:
+                raise ToolFailure("PATCH_FAILED", "No files were modified.", category="validation")
+            if not dry_run:
+                self._commit_staged_files(list(staged.values()))
+        return {
+            "dry_run": dry_run,
+            "clean": True,
+            "already_applied": unchanged_files == len(changes),
+            "revision_algorithm": REVISION_ALGORITHM,
             "summary": "\n".join(summaries),
             "affected_files": affected,
             "additions": additions,
             "removals": removals,
-            "warnings": [],
+            "warnings": warnings,
         }
 
-    def _validate_patch_path(self, raw_path: str, *, require_existing: bool) -> None:
-        if require_existing:
-            self.workspace.resolve_existing(raw_path)
+    def _resolve_change_paths(self, change: ChangeRequest) -> list[tuple[int, str]]:
+        """Validate one change's paths and return the display names it claims."""
+
+        requires_existing = change.action in {"edit", "delete", "move", "copy"}
+        self.workspace.reject_write_symlink(change.path)
+        targets = [(change.index, self._resolve_patch_path(change.path, require_existing=requires_existing))]
+        if change.destination is not None:
+            self.workspace.reject_write_symlink(change.destination)
+            targets.append((change.index, self._resolve_patch_path(change.destination, require_existing=False)))
+        return targets
+
+    def _stage_written_file(
+        self, change: ChangeRequest, staged: dict[str, StagedFile]
+    ) -> tuple[dict[str, Any], str, int, int]:
+        target = self.workspace.resolve_for_write(change.path)
+        content = change.content or ""
+        if change.action == "create" and target.existed:
+            raise ToolFailure(
+                "PATCH_FAILED",
+                f"Cannot create {target.display}: it already exists. Use action \"write\" to replace it.",
+                category="validation",
+            )
+        baseline = FileBaseline.capture(target.path)
+        if target.existed:
+            current = baseline.text(target.display)
+            self._check_revision(change, target.display, current)
         else:
-            self.workspace.resolve_for_write(raw_path)
+            current = None
+            if change.revision is not None:
+                raise ToolFailure(
+                    "REVISION_MISMATCH",
+                    f"{target.display} does not exist, so it has no revision to match.",
+                    category="conflict",
+                    retryable=True,
+                    details={"path": target.display, "expected_revision": change.revision, "exists": False},
+                )
+        unchanged = current == content
+        staged[target.display] = StagedFile(
+            target.display,
+            target.path,
+            content,
+            baseline,
+            baseline.mode,
+            action="verify" if unchanged else "write",
+        )
+        operation = "unchanged" if unchanged else ("create" if current is None else "write")
+        ranges: list[dict[str, int]] = [] if unchanged else _whole_file_range(content)
+        entry = {"path": target.display, "operation": operation, **_patch_evidence(content, ranges)}
+        marker = {"unchanged": "=", "create": "A"}.get(operation, "M")
+        return entry, f"{marker} {target.display}", 0 if unchanged else _count_lines(content), (
+            0 if current is None else _count_lines(current)
+        )
+
+    def _stage_edited_file(
+        self, change: ChangeRequest, staged: dict[str, StagedFile]
+    ) -> tuple[dict[str, Any], str, int, int]:
+        source = self.workspace.resolve_existing(change.path)
+        if source.path.is_dir():
+            raise ToolFailure("PATCH_FAILED", "Cannot edit a directory.", category="validation")
+        baseline = FileBaseline.capture(source.path)
+        current = baseline.text(source.display)
+        self._check_revision(change, source.display, current)
+        outcome = apply_line_edits(current, change.edits, source.display)
+        unchanged = outcome.content == current
+        staged[source.display] = StagedFile(
+            source.display,
+            source.path,
+            current if unchanged else outcome.content,
+            baseline,
+            baseline.mode,
+            action="verify" if unchanged else "write",
+        )
+        added = sum(len(edit.lines) for edit in change.edits)
+        removed = sum(edit.end - edit.start for edit in change.edits)
+        entry = {
+            "path": source.display,
+            "operation": "unchanged" if unchanged else "edit",
+            **_patch_evidence(outcome.content, outcome.changed_ranges),
+        }
+        return entry, f"{'=' if unchanged else 'M'} {source.display}", added, removed
+
+    def _stage_deleted_file(
+        self, change: ChangeRequest, staged: dict[str, StagedFile]
+    ) -> tuple[dict[str, Any], str, int, int]:
+        target = self.workspace.resolve_existing(change.path)
+        if target.path.is_dir():
+            raise ToolFailure("PATCH_FAILED", "Cannot delete a directory.", category="validation")
+        baseline = FileBaseline.capture(target.path)
+        self._check_revision(change, target.display, baseline.text(target.display))
+        staged[target.display] = StagedFile(
+            target.display, target.path, None, baseline, baseline.mode, action="delete"
+        )
+        entry = {"path": target.display, "operation": "delete", "total_lines": 0, "changed_ranges": []}
+        return entry, f"D {target.display}", 0, len((baseline.data or b"").splitlines())
+
+    def _stage_relocated_file(
+        self, change: ChangeRequest, staged: dict[str, StagedFile]
+    ) -> tuple[dict[str, Any], str, int, int]:
+        source = self.workspace.resolve_existing(change.path)
+        if source.path.is_dir():
+            raise ToolFailure("PATCH_FAILED", f"Cannot {change.action} a directory.", category="validation")
+        destination = str(change.destination)
+        dest = self.workspace.resolve_for_write(destination)
+        if dest.existed:
+            raise ToolFailure(
+                "PATCH_FAILED",
+                f"Cannot {change.action} onto {dest.display}: it already exists.",
+                category="validation",
+            )
+        baseline = FileBaseline.capture(source.path)
+        content = baseline.text(source.display)
+        self._check_revision(change, source.display, content)
+        # A copy must still fail if its source changed underneath us, so the
+        # source is staged as a baseline assertion that writes nothing.
+        staged[source.display] = StagedFile(
+            source.display,
+            source.path,
+            None if change.action == "move" else content,
+            baseline,
+            baseline.mode,
+            action="delete" if change.action == "move" else "verify",
+        )
+        staged[dest.display] = StagedFile(
+            dest.display,
+            dest.path,
+            content,
+            FileBaseline.capture(dest.path),
+            baseline.mode,
+            action="write",
+        )
+        entry = {
+            "path": dest.display,
+            "old_path": source.display,
+            "operation": change.action,
+            **_patch_evidence(content, _whole_file_range(content)),
+        }
+        marker = "R" if change.action == "move" else "C"
+        return entry, f"{marker} {source.display} -> {dest.display}", _count_lines(content), 0
+
+    def _check_revision(self, change: ChangeRequest, display: str, current: str) -> None:
+        """Refuse to write over bytes the caller has not seen.
+
+        The revision is the whole point of the tool: line numbers are only
+        meaningful against a known file version, and a stale request that
+        still parses is exactly the failure this refuses to commit.
+        """
+
+        actual = content_revision(current)
+        if change.revision is None:
+            raise ToolFailure(
+                "REVISION_REQUIRED",
+                f"changes[{change.index}] must carry the revision of {display}. "
+                f"Read the file first; its current revision is {actual}.",
+                category="validation",
+                retryable=True,
+                details={
+                    "path": display,
+                    "current_revision": actual,
+                    "revision_algorithm": REVISION_ALGORITHM,
+                    "next_action": {"tool": "read_file", "arguments": {"path": display}},
+                },
+            )
+        if change.revision != actual:
+            raise ToolFailure(
+                "REVISION_MISMATCH",
+                f"{display} changed since revision {change.revision}; it is now {actual}. "
+                "Re-read the file and rebuild the change against its current line numbers.",
+                category="conflict",
+                retryable=True,
+                details={
+                    "path": display,
+                    "expected_revision": change.revision,
+                    "current_revision": actual,
+                    "revision_algorithm": REVISION_ALGORITHM,
+                    "total_lines": _count_lines(current),
+                    "next_action": {"tool": "read_file", "arguments": {"path": display}},
+                },
+            )
+
+    def _validate_patch_path(self, raw_path: str, *, require_existing: bool) -> None:
+        self._resolve_patch_path(raw_path, require_existing=require_existing)
+
+    def _resolve_patch_path(self, raw_path: str, *, require_existing: bool) -> str:
+        """Validate one patch target and return its workspace-relative display name."""
+
+        if require_existing:
+            return self.workspace.resolve_existing(raw_path).display
+        return self.workspace.resolve_for_write(raw_path).display
 
     def _commit_staged_files(self, staged: list[StagedFile]) -> None:
         self.patch_committer.commit(staged)
@@ -2358,8 +3334,8 @@ class Runtime:
         if not workdir.path.is_dir():
             raise ToolFailure("NOT_A_DIRECTORY", "workdir is not a directory.", category="validation")
         self._check_command_policy(cmd, args)
-        timeout_ms = int(args.get("timeout_ms", 30000))
-        yield_ms = int(args.get("yield_time_ms", 10000))
+        timeout_ms = int(args.get("timeout_ms", DEFAULT_PROCESS_LIFETIME_MS))
+        yield_ms = int(args.get("yield_time_ms", DEFAULT_YIELD_MS))
         max_output_bytes = int(args.get("max_output_bytes", 65536))
         tty = bool(args.get("tty", False))
         stdin_text = str(args.get("stdin", ""))
@@ -2368,6 +3344,7 @@ class Runtime:
         deadline = start + (timeout_ms / 1000.0)
         landlock_fd: int | None = None
         landlock_warning: str | None = None
+        landlock_confined = False
         popen_cmd: Any = cmd
         popen_shell = True
         popen_extra = process_group_popen_kwargs()
@@ -2377,14 +3354,23 @@ class Runtime:
                     self.workspace.root,
                     guard_allow_roots(),
                     write_roots=self.landlock_write_roots(),
+                    workspace_writable=not self.workspace_mutation.structured_only,
                 )
                 popen_cmd = landlock_exec_argv(landlock_fd, cmd)
                 popen_shell = False
                 popen_extra["pass_fds"] = (landlock_fd,)
+                landlock_confined = True
             except ToolFailure as exc:
                 if exc.code != "SANDBOX_UNAVAILABLE":
                     raise
                 landlock_warning = landlock_unavailable_warning(exc)
+        mutation = self.workspace_mutation_payload()
+        workspace_may_write = (
+            not self.workspace_mutation.structured_only
+            or mutation.get("enforced") is not True
+            or bool(self._workspace_write_path_roots)
+            or not landlock_confined
+        )
         with self.commands_lock:
             if self._closed or self.command_manager.closed:
                 if landlock_fd is not None:
@@ -2419,6 +3405,8 @@ class Runtime:
                 timeout_at=deadline,
                 warnings=[landlock_warning] if landlock_warning else None,
                 pty_master_fd=pty_master_fd,
+                landlock_confined=landlock_confined,
+                workspace_may_write=workspace_may_write,
             )
             with self.commands_lock:
                 self.starting_commands -= 1
@@ -2428,12 +3416,28 @@ class Runtime:
                     registered = True
             if not registered:
                 raise ToolFailure("COMMAND_CLOSED", "Runtime closed while the command was starting.", category="runtime")
-        except Exception:
+        except Exception as exc:
             with self.commands_lock:
                 if not registered and not slot_released:
                     self.starting_commands -= 1
             if process is not None and process.poll() is None:
                 terminate_process_group(process, signal.SIGTERM)
+            if isinstance(exc, OSError) and process is None:
+                return {
+                    "ok": False,
+                    "status": "failed",
+                    "operation_outcome": "spawn_error",
+                    "error": {
+                        "code": "COMMAND_SPAWN_FAILED",
+                        "message": f"Failed to start command: {exc}",
+                        "category": "runtime",
+                        "retryable": exc.errno in {errno.EAGAIN, errno.ENOMEM},
+                        "details": {
+                            "errno": exc.errno,
+                            "reason": exc.strerror or str(exc),
+                        },
+                    },
+                }
             raise
         finally:
             if landlock_fd is not None:
@@ -2453,7 +3457,7 @@ class Runtime:
         finally:
             if not tty:
                 command.close_stdin()
-        initial_wait = max(0, min(yield_ms, 30000)) / 1000.0
+        initial_wait = max(0, min(yield_ms, MAX_YIELD_MS)) / 1000.0
 
         def finish() -> dict[str, Any]:
             # snapshot_since_cursor owns the status mapping (running/exited/
@@ -2725,6 +3729,8 @@ class Runtime:
         timeout_at: float | None = None,
         warnings: list[str] | None = None,
         pty_master_fd: int | None = None,
+        landlock_confined: bool = False,
+        workspace_may_write: bool = True,
     ) -> CommandRun:
         return CommandRun(
             command_id=secrets.token_urlsafe(18),
@@ -2732,6 +3738,8 @@ class Runtime:
             timeout_at=timeout_at,
             warnings=warnings or [],
             pty_master_fd=pty_master_fd,
+            landlock_confined=landlock_confined,
+            workspace_may_write=workspace_may_write,
             on_evict=self.command_manager.record_output_eviction,
         )
 
@@ -2805,7 +3813,7 @@ class Runtime:
                 "arguments": {
                     "command_id": command.command_id,
                     "chars": "",
-                    "yield_time_ms": 10000,
+                    "yield_time_ms": DEFAULT_YIELD_MS,
                 },
             }
         output_refs = {
@@ -2965,6 +3973,19 @@ class Runtime:
         if omitted_bytes:
             self.command_manager.record_omitted_read("read_output")
         result = {
+            "command_id": command.command_id,
+            "operation_outcome": command_outcome(
+                "timeout"
+                if command.timed_out
+                else "running"
+                if command.process.poll() is None
+                else "terminated"
+                if command.signal_name is not None
+                else "exited",
+                command.exit_code,
+                command.signal_name,
+                command.timed_out,
+            ),
             "output_ref": output_ref,
             "stream_output_ref": f"command:{command.command_id}:{stream}",
             "stream": stream,
@@ -3004,7 +4025,7 @@ class Runtime:
             return self._format_command_output(command, payload, args)
         if chars:
             command.write_input(chars.encode("utf-8"))
-        wait_until = time.time() + (int(args.get("yield_time_ms", 10000)) / 1000.0)
+        wait_until = time.time() + (int(args.get("yield_time_ms", DEFAULT_YIELD_MS)) / 1000.0)
         first_output_at: float | None = None
         while time.time() < wait_until and command.process.poll() is None:
             time.sleep(0.02)
@@ -3144,6 +4165,7 @@ class Runtime:
         git_env = self._git_env()
         staged = bool(args.get("staged", False))
         unstaged = bool(args.get("unstaged", True))
+        include_untracked = bool(args.get("include_untracked", True))
         context = int(args.get("context_lines", 3))
         max_bytes = int(args.get("max_bytes", 262144))
         path_filters = self._git_path_filters(args)
@@ -3154,6 +4176,16 @@ class Runtime:
             chunks.append(self._run_git_diff(git, context, path_filters, cached=False, env=git_env))
         if staged:
             chunks.append(self._run_git_diff(git, context, path_filters, cached=True, env=git_env))
+        warnings: list[str] = []
+        # A file created by apply_patch is untracked, so plain `git diff` cannot
+        # confirm it exists. Diff each untracked path against an empty file so
+        # an added file is verifiable from the same output as an edited one.
+        if include_untracked and unstaged:
+            untracked_chunks, untracked_warnings = self._untracked_diffs(
+                git, context, path_filters, max_bytes, env=git_env
+            )
+            chunks.extend(untracked_chunks)
+            warnings.extend(untracked_warnings)
         combined = b""
         for chunk in chunks:
             if combined and chunk and not combined.endswith(b"\n"):
@@ -3162,12 +4194,69 @@ class Runtime:
         diff_truncation = truncate_text_head(combined.decode("utf-8", errors="replace"), max_lines=DEFAULT_MAX_LINES, max_bytes=max_bytes)
         diff_text = diff_truncation.content
         truncated = diff_truncation.truncated
+        if truncated:
+            warnings.append("diff truncated")
         return {
             "diff": diff_text,
             "files": parse_diff_files(diff_text),
+            "include_untracked": include_untracked and unstaged,
             **truncation_fields(diff_truncation),
-            "warnings": ["diff truncated"] if truncated else [],
+            "warnings": warnings,
         }
+
+    def _untracked_diffs(
+        self,
+        git: str,
+        context: int,
+        path_filters: list[str],
+        max_bytes: int,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> tuple[list[bytes], list[str]]:
+        listing = [git, "-C", str(self.workspace.root), "ls-files", "--others", "--exclude-standard", "-z"]
+        if path_filters:
+            listing.append("--")
+            listing.extend(path_filters)
+        completed = self._run_git_bytes(listing, timeout=10, env=env)
+        if completed.returncode != 0:
+            return [], ["untracked files could not be listed"]
+        paths = [entry for entry in completed.stdout.decode("utf-8", errors="replace").split("\0") if entry]
+        chunks: list[bytes] = []
+        warnings: list[str] = []
+        if len(paths) > MAX_UNTRACKED_DIFF_FILES:
+            warnings.append(
+                f"only the first {MAX_UNTRACKED_DIFF_FILES} of {len(paths)} untracked files are diffed"
+            )
+            paths = paths[:MAX_UNTRACKED_DIFF_FILES]
+        spent = 0
+        for rel in paths:
+            if spent >= max_bytes:
+                warnings.append("untracked diff truncated")
+                break
+            chunk = self._run_git_bytes(
+                [
+                    git,
+                    "-C",
+                    str(self.workspace.root),
+                    "diff",
+                    "--no-index",
+                    f"--unified={context}",
+                    "--",
+                    os.devnull,
+                    rel,
+                ],
+                timeout=10,
+                env=env,
+            )
+            # --no-index reports a difference with exit 1; anything else is a
+            # per-file problem (unreadable path, vanished file) that must not
+            # fail the whole diff.
+            if chunk.returncode not in {0, 1}:
+                warnings.append(f"untracked file could not be diffed: {rel}")
+                continue
+            chunks.append(chunk.stdout)
+            spent += len(chunk.stdout)
+        return chunks, warnings
 
     def _run_git_diff(
         self, git: str, context: int, path_filters: list[str], *, cached: bool, env: dict[str, str] | None = None
@@ -4114,7 +5203,13 @@ def landlock_device_access(handled: int) -> int:
     )
 
 
-def open_landlock_ruleset(workspace: Path, read_roots: list[str], *, write_roots: list[Path] | None = None) -> int:
+def open_landlock_ruleset(
+    workspace: Path,
+    read_roots: list[str],
+    *,
+    write_roots: list[Path] | None = None,
+    workspace_writable: bool = True,
+) -> int:
     version = landlock_abi_version()
     handled = landlock_handled_access(version)
     ruleset_attr = LandlockRulesetAttr(handled)
@@ -4138,7 +5233,12 @@ def open_landlock_ruleset(workspace: Path, read_roots: list[str], *, write_roots
             LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR
         )
         device_access = landlock_device_access(handled)
-        add_landlock_path(ruleset_fd, workspace, workspace_access)
+        # Under structured-only the workspace itself is read-only for the
+        # command, so the write roots below are the complete list of places a
+        # command may still write.
+        add_landlock_path(
+            ruleset_fd, workspace, workspace_access if workspace_writable else readonly_access
+        )
         for write_root in write_roots or []:
             add_landlock_path(ruleset_fd, write_root, workspace_access, required=False)
         for read_root in read_roots:
@@ -4435,8 +5535,18 @@ def object_schema(properties: dict[str, Any] | None = None, required: list[str] 
     }
 
 
-def tool_output_schema() -> dict[str, Any]:
-    return {
+def tool_output_schema(name: str | None = None) -> dict[str, Any]:
+    """Declare what one tool actually returns, not just that it returns `ok`.
+
+    One generic schema for eighteen tools told a client nothing: every field a
+    caller needed — `command_id`, `exit_code`, `output_ref`, patch evidence —
+    was undeclared. Each entry below adds the tool's own fields on top of the
+    shared envelope. `additionalProperties` stays open because payloads still
+    carry advisory fields (warnings, next_action) that are not part of the
+    contract.
+    """
+
+    schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "ok": {"type": "boolean"},
@@ -4455,6 +5565,194 @@ def tool_output_schema() -> dict[str, Any]:
         },
         "required": ["ok"],
         "additionalProperties": True,
+    }
+    if name is not None:
+        schema["properties"] = {**schema["properties"], **output_schemas().get(name, {})}
+    return schema
+
+
+@functools.cache
+def output_schemas() -> dict[str, dict[str, Any]]:
+    string: dict[str, Any] = {"type": "string"}
+    nullable_string: dict[str, Any] = {"type": ["string", "null"]}
+    integer: dict[str, Any] = {"type": "integer"}
+    nullable_integer: dict[str, Any] = {"type": ["integer", "null"]}
+    boolean: dict[str, Any] = {"type": "boolean"}
+    string_array: dict[str, Any] = {"type": "array", "items": {"type": "string"}}
+    object_array: dict[str, Any] = {"type": "array", "items": {"type": "object", "additionalProperties": True}}
+    truncation: dict[str, Any] = {
+        "truncated": boolean,
+        "truncated_by": nullable_string,
+        "output_lines": integer,
+        "output_bytes": integer,
+        "warnings": string_array,
+    }
+    command_result: dict[str, Any] = {
+        "command_id": string,
+        "status": string,
+        "operation_outcome": {**string, "enum": list(COMMAND_OUTCOMES)},
+        "exit_code": nullable_integer,
+        "signal": nullable_string,
+        "timed_out": boolean,
+        "stdout": string,
+        "stderr": string,
+        "stdout_truncated": boolean,
+        "stderr_truncated": boolean,
+        "stdout_truncated_by": nullable_string,
+        "stderr_truncated_by": nullable_string,
+        "stdout_output_lines": integer,
+        "stderr_output_lines": integer,
+        "stdout_output_bytes": integer,
+        "stderr_output_bytes": integer,
+        "stdout_dropped_bytes": integer,
+        "stderr_dropped_bytes": integer,
+        "stdout_omitted_bytes": integer,
+        "stderr_omitted_bytes": integer,
+        "output_ref": nullable_string,
+        "output_stream": string,
+        "output_refs": {"type": "object", "additionalProperties": {"type": "string"}},
+        "output_truncated": boolean,
+        "truncated_output_streams": string_array,
+        "truncated": boolean,
+        "next_action": {"type": ["object", "null"], "additionalProperties": True},
+        "next_actions": object_array,
+        "summary": string,
+        "preview": string,
+        "preview_truncated": boolean,
+        "warnings": string_array,
+    }
+    patch_result: dict[str, Any] = {
+        "dry_run": boolean,
+        "clean": boolean,
+        "already_applied": boolean,
+        "idempotent_replay": boolean,
+        "revision_algorithm": {**string, "enum": [REVISION_ALGORITHM]},
+        "summary": string,
+        "affected_files": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": string,
+                    "old_path": string,
+                    "operation": string,
+                    "revision": string,
+                    "total_lines": integer,
+                    "match_quality": string,
+                    "changed_ranges": object_array,
+                },
+                "additionalProperties": True,
+            },
+        },
+        "additions": integer,
+        "removals": integer,
+        "warnings": string_array,
+    }
+    git_text: dict[str, Any] = {"truncated": boolean, "warnings": string_array}
+    return {
+        "server_info": {
+            "server": string,
+            "version": string,
+            "workspace": string,
+            "permission_mode": string,
+            "workspace_mutation_policy": {"type": "object", "additionalProperties": True},
+            "tools": string_array,
+            "tool_count": integer,
+        },
+        "check_exec_environment": {
+            "workspace": string,
+            "permission_mode": string,
+            "landlock_enabled": boolean,
+            "landlock_abi": nullable_integer,
+            "warnings": string_array,
+        },
+        "read_file": {
+            "path": string,
+            "content": string,
+            "encoding": string,
+            "revision": string,
+            "revision_algorithm": {**string, "enum": [REVISION_ALGORITHM]},
+            "start_line": integer,
+            "end_line": integer,
+            "total_lines": integer,
+            "total_bytes": integer,
+            "bytes_read": integer,
+            "next_start_line": nullable_integer,
+            "first_line_exceeds_limit": boolean,
+            **truncation,
+        },
+        "list_dir": {"path": string, "entries": object_array, **truncation},
+        "list_files": {"path": string, "files": object_array, **truncation},
+        "search_text": {
+            "query": string,
+            "matches": object_array,
+            "total_matches": integer,
+            "total_matches_exact": boolean,
+            "engine": string,
+            **truncation,
+        },
+        "apply_patch": patch_result,
+        "apply_changes": patch_result,
+        "exec_command": {**command_result, "elapsed_ms": integer},
+        "write_stdin": command_result,
+        "kill_command": {
+            **command_result,
+            "killed": boolean,
+            "evicted": boolean,
+            "signal_sent": nullable_string,
+            "next_action": {
+                "type": ["object", "string", "null"],
+                "additionalProperties": True,
+            },
+        },
+        # Paging a retained stream, not running one: this result has none of
+        # the head-truncation fields the `truncation` block declares, and its
+        # byte counts are per stream rather than one `total_bytes`.
+        "read_output": {
+            "command_id": string,
+            "operation_outcome": {**string, "enum": list(COMMAND_OUTCOMES)},
+            "output_ref": string,
+            "stream_output_ref": string,
+            "stream": string,
+            "content": string,
+            "offset": integer,
+            "requested_offset": integer,
+            "limit": integer,
+            "next_offset": nullable_integer,
+            "total_stream_bytes": integer,
+            "total_retained_bytes": integer,
+            "head_retained_bytes": integer,
+            "retained_start_offset": integer,
+            "evicted_gap_bytes": integer,
+            "omitted_bytes": integer,
+            "stream_dropped_bytes": integer,
+            "stdout_dropped_bytes": integer,
+            "stderr_dropped_bytes": integer,
+            "truncated": boolean,
+            "next_action": {"type": ["object", "null"], "additionalProperties": True},
+            "warnings": string_array,
+        },
+        "git_status": {"is_repo": boolean, "branch": nullable_string, "entries": object_array, **git_text},
+        "git_diff": {"diff": string, "files": object_array, "include_untracked": boolean, **git_text},
+        "git_log": {"is_repo": boolean, "commits": object_array, **git_text},
+        "git_show": {"content": string, "files": object_array, **git_text},
+        "git_blame": {"path": string, "lines": object_array, **git_text},
+        "request_permissions": {
+            "status": string,
+            "grant_id": nullable_string,
+            "expires_at": nullable_string,
+            "constraints": {"type": "object", "additionalProperties": True},
+            "warnings": string_array,
+        },
+        "view_image": {
+            "path": string,
+            "mime_type": string,
+            "width": nullable_integer,
+            "height": nullable_integer,
+            "bytes": integer,
+            "resized": boolean,
+            "warnings": string_array,
+        },
     }
 
 
@@ -4475,6 +5773,9 @@ def validate_schema_value(value: Any, schema: dict[str, Any], *, path: str) -> N
         min_length = schema.get("minLength")
         if isinstance(min_length, int) and len(value) < min_length:
             raise ToolFailure("INVALID_ARGUMENT", f"{path} is shorter than {min_length}.", category="validation")
+        max_length = schema.get("maxLength")
+        if isinstance(max_length, int) and len(value) > max_length:
+            raise ToolFailure("INVALID_ARGUMENT", f"{path} is longer than {max_length}.", category="validation")
         if "enum" in schema and value not in schema["enum"]:
             raise ToolFailure("INVALID_ARGUMENT", f"{path} must be one of {schema['enum']!r}.", category="validation")
 
@@ -4486,10 +5787,17 @@ def validate_schema_value(value: Any, schema: dict[str, Any], *, path: str) -> N
         if isinstance(maximum, (int, float)) and value > maximum:
             raise ToolFailure("INVALID_ARGUMENT", f"{path} must be <= {maximum}.", category="validation")
 
-    if isinstance(value, list) and isinstance(schema.get("items"), dict):
-        item_schema = schema["items"]
-        for index, item in enumerate(value):
-            validate_schema_value(item, item_schema, path=f"{path}[{index}]")
+    if isinstance(value, list):
+        min_items = schema.get("minItems")
+        if isinstance(min_items, int) and len(value) < min_items:
+            raise ToolFailure("INVALID_ARGUMENT", f"{path} needs at least {min_items} items.", category="validation")
+        max_items = schema.get("maxItems")
+        if isinstance(max_items, int) and len(value) > max_items:
+            raise ToolFailure("INVALID_ARGUMENT", f"{path} holds more than {max_items} items.", category="validation")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                validate_schema_value(item, item_schema, path=f"{path}[{index}]")
 
     if isinstance(value, dict):
         properties = schema.get("properties", {})
@@ -4542,7 +5850,7 @@ def tool_definition(name: str, *, fake_readonly: bool = False) -> dict[str, Any]
         "title": annotations["title"],
         "description": TOOL_REGISTRY[name].description,
         "inputSchema": schemas[name],
-        "outputSchema": tool_output_schema(),
+        "outputSchema": tool_output_schema(name),
         "annotations": annotations,
     }
 
@@ -4635,14 +5943,152 @@ def input_schemas() -> dict[str, dict[str, Any]]:
             },
             ["query"],
         ),
-        "apply_patch": object_schema({"patch": {**string, "minLength": 1}, "dry_run": {**boolean, "default": False}}, ["patch"]),
+        "apply_patch": object_schema(
+            {
+                "patch": {**string, "minLength": 1},
+                "dry_run": {**boolean, "default": False},
+                "idempotency_key": {
+                    **string,
+                    "minLength": 1,
+                    "maxLength": IDEMPOTENCY_KEY_MAX_LENGTH,
+                    "description": IDEMPOTENCY_KEY_DESCRIPTION,
+                },
+            },
+            ["patch"],
+        ),
+        "apply_changes": object_schema(
+            {
+                "changes": {
+                    "type": "array",
+                    # No minItems: an empty array is answered by the handler with
+                    # the same readable PATCH_FAILED apply_patch gives an empty
+                    # envelope, rather than a transport-level invalid-params
+                    # error the model cannot act on.
+                    "maxItems": MAX_CHANGES_PER_CALL,
+                    "description": (
+                        "One entry per file, at least one. A path may appear once per call; use "
+                        "apply_patch to chain several edits onto one file. The whole request must fit in "
+                        "1 MiB, so keep it to roughly 20 files per call."
+                    ),
+                    "items": object_schema(
+                        {
+                            "action": {
+                                **string,
+                                "enum": list(CHANGE_ACTIONS),
+                                "description": (
+                                    "create writes a file that must not exist; write upserts one; edit "
+                                    "applies line operations; delete removes; move and copy need a "
+                                    "destination that must not exist."
+                                ),
+                            },
+                            "path": {**string, "minLength": 1},
+                            "revision": {
+                                **string,
+                                "minLength": 1,
+                                "description": (
+                                    "The revision read_file reported for this path. Required for write "
+                                    "when the path exists, and always for edit, delete, move, and copy; "
+                                    "write may omit it when creating a missing path, and create rejects "
+                                    "it. A file that changed since is refused with REVISION_MISMATCH."
+                                ),
+                            },
+                            "content": {
+                                **string,
+                                "description": "Full file text for create and write.",
+                            },
+                            "destination": {
+                                **string,
+                                "minLength": 1,
+                                "description": "Target path for move and copy; must not already exist.",
+                            },
+                            "edits": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": MAX_EDITS_PER_CHANGE,
+                                "description": (
+                                    "Line operations for action=edit. Every line number refers to the "
+                                    "file as read_file reported it, never to the result of another edit "
+                                    "in the same call, and no two edits may address the same lines."
+                                ),
+                                "items": object_schema(
+                                    {
+                                        "op": {**string, "enum": list(EDIT_OPERATIONS)},
+                                        "start_line": {
+                                            **integer,
+                                            "minimum": 1,
+                                            "description": (
+                                                "First line of the range for replace and delete, "
+                                                "1-based and inclusive."
+                                            ),
+                                        },
+                                        "end_line": {
+                                            **integer,
+                                            "minimum": 1,
+                                            "description": (
+                                                "Last line of the range for replace and delete, "
+                                                "inclusive; defaults to start_line."
+                                            ),
+                                        },
+                                        "line": {
+                                            **integer,
+                                            "minimum": 0,
+                                            "description": (
+                                                "Anchor for insert_after (0 to total_lines, where 0 "
+                                                "inserts at the beginning) or insert_before (1 to "
+                                                "total_lines + 1, where total_lines + 1 appends)."
+                                            ),
+                                        },
+                                        "content": {
+                                            **string,
+                                            "description": (
+                                                "Whole lines to write. \"\" is zero lines, which makes "
+                                                "replace with empty content a deletion; a trailing "
+                                                "newline adds a blank line. Not accepted for op=delete."
+                                            ),
+                                        },
+                                    },
+                                    ["op"],
+                                ),
+                            },
+                        },
+                        ["action", "path"],
+                    ),
+                },
+                "dry_run": {**boolean, "default": False},
+                "idempotency_key": {
+                    **string,
+                    "minLength": 1,
+                    "maxLength": IDEMPOTENCY_KEY_MAX_LENGTH,
+                    "description": IDEMPOTENCY_KEY_DESCRIPTION,
+                },
+            },
+            ["changes"],
+        ),
         "exec_command": object_schema(
             {
                 "cmd": {**string, "minLength": 1},
                 "workdir": {**string, "default": "."},
                 "cwd": {**string},
-                "timeout_ms": {**integer, "minimum": 1, "maximum": 600000, "default": 30000},
-                "yield_time_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 10000},
+                "timeout_ms": {
+                    **integer,
+                    "minimum": 1,
+                    "maximum": MAX_PROCESS_LIFETIME_MS,
+                    "default": DEFAULT_PROCESS_LIFETIME_MS,
+                    "description": (
+                        "Total process lifetime in milliseconds. The command is killed when this "
+                        "elapses, whether or not the call has already returned."
+                    ),
+                },
+                "yield_time_ms": {
+                    **integer,
+                    "minimum": 0,
+                    "maximum": MAX_YIELD_MS,
+                    "default": DEFAULT_YIELD_MS,
+                    "description": (
+                        "How long this call waits before returning. A command still running at that "
+                        "point keeps running and returns a command_id; it is not killed."
+                    ),
+                },
                 "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
                 "verbosity": {**string, "enum": ["summary", "preview", "full"]},
                 "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
@@ -4656,7 +6102,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
             {
                 "command_id": {**string, "minLength": 1},
                 "chars": {**string, "default": ""},
-                "yield_time_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 10000},
+                "yield_time_ms": {**integer, "minimum": 0, "maximum": MAX_YIELD_MS, "default": DEFAULT_YIELD_MS},
                 "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
                 "verbosity": {**string, "enum": ["summary", "preview", "full"]},
                 "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
@@ -4697,6 +6143,14 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "paths": string_array,
                 "staged": {**boolean, "default": False},
                 "unstaged": {**boolean, "default": True},
+                "include_untracked": {
+                    **boolean,
+                    "default": True,
+                    "description": (
+                        "Diff untracked files against an empty file so newly created files appear "
+                        "as additions. Applies to the unstaged pass only."
+                    ),
+                },
                 "context_lines": {**integer, "minimum": 0, "maximum": 20, "default": 3},
                 "max_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 262144},
             }
@@ -4742,7 +6196,6 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                         "shell_expansion",
                         INLINE_SCRIPT_PERMISSION,
                         "privileged_executable",
-                        "write_generated_or_ignored",
                     ],
                 },
                 "reason": {**string, "minLength": 1},
@@ -5538,6 +6991,7 @@ def build_runtime(
         oauth_config=oauth_config,
         project_context=project_context,
         fake_readonly_annotations=runtime_policy.fake_readonly_annotations,
+        workspace_mutation=runtime_policy.workspace_mutation,
         transport=transport,
         command_manager=command_manager,
     )
@@ -5546,6 +7000,10 @@ def build_runtime(
             "WARNING: permission_mode=dangerous disables MCP safety gates. Use only inside an isolated container or VM.",
             file=sys.stderr,
         )
+    mutation = runtime.workspace_mutation_payload()
+    if emit_warning and runtime.workspace_mutation.structured_only and not mutation["enforced"]:
+        for warning in mutation.get("warnings", []):
+            print(f"WARNING: {warning}.", file=sys.stderr)
     if emit_warning and runtime.fake_readonly_annotations:
         print(
             "WARNING: tools/list reports every tool as read-only and non-destructive. "
@@ -5666,7 +7124,17 @@ def run_http(args: argparse.Namespace) -> int:
         )
         return 2
 
-    runtime = build_runtime(args, runtime_policy, auth_token=auth_token, oauth_config=oauth_config, transport="http")
+    try:
+        runtime = build_runtime(
+            args,
+            runtime_policy,
+            auth_token=auth_token,
+            oauth_config=oauth_config,
+            transport="http",
+        )
+    except ToolFailure as exc:
+        print(f"ERROR: {exc.code}: {exc.message}", file=sys.stderr)
+        return 2
     server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime)
     if oauth_config:
         url_label = oauth_config.server_url or "dynamic request URL"
@@ -5693,7 +7161,11 @@ def run_stdio(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    runtime = build_runtime(args, runtime_policy)
+    try:
+        runtime = build_runtime(args, runtime_policy)
+    except ToolFailure as exc:
+        print(f"ERROR: {exc.code}: {exc.message}", file=sys.stderr)
+        return 2
     return serve_stdio(runtime)
 
 
@@ -5749,6 +7221,29 @@ def build_parser() -> argparse.ArgumentParser:
             "exec_command permission mode: safe denies network/shell-expansion/inline-script gates; "
             "trusted allows local development network, shell expansion, and inline scripts; "
             "dangerous disables permission gates"
+        ),
+    )
+    parser.add_argument(
+        "--workspace-mutation",
+        choices=WORKSPACE_MUTATION_CHOICES,
+        default=None,
+        help=(
+            "who may write to the workspace: unrestricted (default) lets exec_command write; "
+            "structured-only makes the workspace read-only for commands under Landlock, leaving "
+            "apply_patch and apply_changes as the only way in. Experimental: it breaks any command "
+            "that writes into the tree (pytest caches, npm, cargo, gradle, git) unless every such "
+            f"directory is listed with --write-path; also settable with {ENV_PREFIX}_WORKSPACE_MUTATION"
+        ),
+    )
+    parser.add_argument(
+        "--write-path",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help=(
+            "workspace-relative directory that stays writable under "
+            "--workspace-mutation structured-only; repeatable, and also settable as an "
+            f"os.pathsep-separated {ENV_PREFIX}_WRITE_PATHS"
         ),
     )
     parser.add_argument(

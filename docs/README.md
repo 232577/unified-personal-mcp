@@ -26,10 +26,13 @@ The documentation keeps stable file paths for existing links, while this index p
 - [Exec command recipes](exec-command-recipes.md)
 - [Exec troubleshooting](troubleshooting-exec.md)
 - [Migration to 0.3](migration-0.3.md)
+- [Migration to 0.5](migration-0.5.md)
 - [Profile](profile.md)
 
 ## Engineering and evaluation
 
+- [v0.5.0 execution plan](plan-v0.5.md)
+- [Real-task agent evaluation](agent-evaluation.md)
 - [CI and tests](ci-and-tests.md)
 - [Boundary findings](boundary-findings.md)
 - [Competitive analysis](competitive-analysis.md)

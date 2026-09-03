@@ -2,6 +2,132 @@
 
 ## Unreleased
 
+The v0.5.0 reliability work. Migration notes:
+[docs/migration-0.5.md](docs/migration-0.5.md); rationale:
+[docs/plan-v0.5.md](docs/plan-v0.5.md).
+
+### Breaking
+
+- **`request_permissions` is advertised only in `dangerous` mode.** Outside it
+  the tool can only answer `ELICITATION_UNSUPPORTED`, which is where roughly
+  60% of its observed calls went. It stays callable when hidden, so a direct
+  call still gets that same answer rather than `Unknown tool`. The registry
+  holds 19 tools; `safe` and `trusted` advertise 18 and `dangerous` advertises
+  19. A client that hardcodes the catalog must read `tools/list`.
+- **The `write_generated_or_ignored` permission kind is removed** from the
+  `request_permissions` schema. It was an enum value no code path requested or
+  granted.
+- **`read_file` model text now opens with a banner** —
+  `[Showing lines 1-40 of 40 revision=…]` — on every read, not only a
+  truncated one. `apply_changes` needs that revision and most clients forward
+  only the text. `structuredContent.content` is unchanged.
+- **`exec_command`'s default `timeout_ms` is now 300000** (was 30000).
+  `timeout_ms` always meant total process lifetime, but the old default was
+  shorter than an install or a build, so a command backgrounded by the yield
+  was killed shortly after the call returned. `yield_time_ms` still defaults to
+  10000 and the 600000 maximum is unchanged.
+
+### Added
+
+- **`apply_changes`**, a line-addressed editing tool. Each change names an
+  action (`create`, `write`, `edit`, `delete`, `move`, `copy`) and a path.
+  Existing targets use the `revision` `read_file` reported. `write` is an
+  upsert and may omit it when creating a missing path; `create` asserts absence.
+  Nothing has to match textually, and a file that changed since it was read is
+  refused with `REVISION_MISMATCH` instead of being overwritten. A path may
+  appear once per call.
+- **`read_file` reports a `revision`**, a SHA-256 of the whole file computed
+  during the pass that already streams it, so no second read can disagree with
+  the bytes the model saw.
+- **`--workspace-mutation=structured-only` and repeatable `--write-path`**,
+  off by default. Structured-only makes the workspace read-only for
+  `exec_command` under Landlock, leaving `apply_patch` and `apply_changes` as
+  the only way in. Experimental: it breaks any command that writes into the
+  tree unless that directory is allowlisted. Also settable as
+  `CODING_TOOLS_MCP_WORKSPACE_MUTATION` and `CODING_TOOLS_MCP_WRITE_PATHS`;
+  the effective policy and whether it is enforced appear in `server_info` as
+  `workspace_mutation_policy`. Full enforcement requires Landlock ABI 3 or
+  newer, and missing in-workspace write directories are created before rules
+  are installed.
+- **`idempotency_key` on `apply_patch` and `apply_changes`.** Replaying a key
+  with the same arguments returns the recorded result instead of doing the work
+  twice, so a lost response is safe to retry. A key names one request: it is
+  recorded with a fingerprint of the arguments that earned it, reusing it for
+  different arguments is `IDEMPOTENCY_KEY_REUSED` rather than a replay of work
+  that was never done, and a `dry_run` result is never recorded at all. The
+  runtime keeps one 64-entry LRU of `(tool, key)` results across both tools,
+  not a separate cache per tool.
+- **A repeat-failure circuit breaker.** The third byte-identical call that
+  would produce the same deterministic error is refused with
+  `REPEATED_CALL_BLOCKED`. Changing any argument gives the revised call a fresh
+  budget; a successful write, including a move whose hunks were already
+  present, clears the breaker entirely. The first terminal observation of each
+  `command_id` from `exec_command`, `write_stdin`, `read_output`, or
+  `kill_command` also clears it when that command could write: in unrestricted
+  mode, under an unenforced structured-only policy, through a configured write
+  path, or after Landlock setup failed open. Later observations of the same
+  command do not clear it again. `IDEMPOTENCY_KEY_REUSED` is excluded because
+  its repair is a new key.
+- **Per-tool `outputSchema`** in `tools/list`, replacing one generic envelope.
+- **A real-task evaluation harness** under `benchmarks/agent_eval/`, which runs
+  the same tasks and prompt through an agent's native tools and through this
+  server and scores both on pass rate, first-attempt success, rounds to green,
+  regressions, and wall time. See
+  [docs/agent-evaluation.md](docs/agent-evaluation.md). Its gates are
+  release-announcement criteria, not merge criteria.
+
+### Changed
+
+- **`apply_patch` locates hunks with more than context.** `@@ <scope>` headers
+  and `*** End of File` now participate in placing a hunk instead of being
+  ignored.
+- **Patch matching is graded** — exact, then ignoring trailing whitespace, then
+  ignoring indentation width — and the grade actually used is reported in
+  `match_quality`, so a downgrade is visible rather than silent.
+- **A successful patch returns evidence**: `changed_ranges`, a per-file
+  `revision`, and `total_lines`. These are evidence only; `apply_patch` still
+  takes no `revision` argument, because its context lines are already its
+  optimistic check. For chained blocks, ranges describe the net original
+  baseline-to-final result rather than accumulated intermediate ranges.
+- **A failed patch returns repair data**: the hunk index, nearby numbered text,
+  and candidate match positions, so the next attempt can be aimed.
+- **A patch whose changes are already present reports `already_applied`**
+  instead of failing, when the result is locatable: an exact or
+  trailing-whitespace match of a block that carries a context line, or a
+  multi-line addition. A context-free single line that happens to occur
+  somewhere in the file is a coincidence, not a completed edit, and still
+  fails with `PATCH_CONTEXT_NOT_FOUND`. A `*** Move to:` that actually
+  relocates the file remains a write and reports `already_applied: false` even
+  when every hunk was already present.
+- **Same-path chaining in `apply_patch` is now promised.** Several
+  `*** Update File` blocks naming one path in one envelope chain in order. This
+  already worked and is now documented, unit-tested, and covered by
+  `make test-patch-repro` in CI.
+- **`apply_changes` compares paths after resolving them**, so `a.txt` and
+  `./a.txt` are one path: naming both is `INVALID_ARGUMENT` rather than a
+  silent overwrite reported as two applied changes.
+- **`git_diff` includes untracked files** by default, so a file created by
+  `apply_patch` is visible. Pass `include_untracked: false` for the old
+  behavior.
+- **Telemetry counts operations truthfully.** A command that exits nonzero,
+  times out, or dies on a signal is no longer recorded as a successful tool
+  call; its terminal outcome is counted once rather than again on every
+  `exec_command`, `write_stdin`, `read_output`, or `kill_command` observation;
+  and consecutive failures are tracked per (tool, error code) rather than in
+  one global slot any tool's success could reset. A 0.5.0 dashboard is not
+  comparable to an earlier one.
+- **`check_exec_environment` warns on non-Linux hosts** that there is no
+  Landlock and therefore no filesystem confinement.
+- **`server_info` discloses the output retention TTL and the completed-command
+  cap**, which [docs/limitations.md](docs/limitations.md) points callers at.
+- Project instructions now tell a model to prefer `apply_changes` and
+  `apply_patch` over `exec_command` for file edits.
+- The runtime contract now states that `patch_lock` serializes patches within
+  one server process only; two servers on one workspace are protected by the
+  pre-commit baseline recheck alone.
+
+### Other
+
 - Moved the source-checkout tunnel launchers to `integrations/tunnels/` so user-facing runtime integrations no longer live under repository-maintenance scripts. The previously documented `scripts/tunnel.sh` entry point remains as a compatibility wrapper.
 - Organized repository-owned components by responsibility: the npm launcher now lives in `packages/npm-launcher/`, the Cloudflare sandbox control plane in `infra/cloudflare/sandbox-control/`, and promo-video sources in `media/promo-video/`.
 

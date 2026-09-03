@@ -123,6 +123,20 @@ class ApplyPatchGoldenTests(ComplianceTestCase):
         self.assertEqual(update_payload.get("removals"), 1)
         self.assertIn("(+1 -1)", self.tool_text(update_result))
         self.assertIn("return a + b", self.tool_text(self.client.call_tool("read_file", {"path": "src/math.js"})))
+        evidence = update_payload["affected_files"][0]
+        self.assertEqual(evidence.get("match_quality"), "exact")
+        self.assertRegex(evidence.get("revision", ""), r"^[0-9a-f]{64}$")
+        self.assertEqual(evidence.get("total_lines"), 7)
+        self.assertEqual(evidence.get("changed_ranges"), [{"start_line": 2, "end_line": 2, "added_lines": 1, "removed_lines": 1}])
+        self.assertIn(f"revision={evidence['revision']}", self.tool_text(update_result))
+
+        # A lost response must not turn into an error the model cannot recover
+        # from: the same envelope replayed reports the work as already done.
+        replay = self.client.call_tool("apply_patch", {"patch": ADD_FIX_PATCH})
+        replay_payload = self.assert_tool_success(replay)
+        self.assertIs(replay_payload.get("already_applied"), True)
+        self.assertEqual(replay_payload["affected_files"][0].get("operation"), "unchanged")
+        self.assertEqual(replay_payload["affected_files"][0].get("revision"), evidence["revision"])
 
         delete = """*** Begin Patch
 *** Delete File: TODO.md
@@ -145,10 +159,14 @@ class ApplyPatchGoldenTests(ComplianceTestCase):
 *** Update File: src/math.js
 @@
 -  return no_such_context;
-+  return a + b;
++  return no_such_replacement;
 *** End Patch
 """
-        self.assert_tool_error("apply_patch", {"patch": mismatch})
+        payload = self.assert_tool_error("apply_patch", {"patch": mismatch})
+        details = payload.get("error", {}).get("details", {})
+        self.assertEqual(details.get("hunk_index"), 0)
+        self.assertIn("nearby_text", details)
+        self.assertRegex(details["nearby_text"], r"^\d+: ")
 
     def test_apply_patch_preserves_bom_crlf_and_rejects_ambiguous_context(self) -> None:
         crlf_file = self.workspace.root / "src" / "crlf.txt"
@@ -330,6 +348,27 @@ class ExecAndGitGoldenTests(ComplianceTestCase):
         self.assertIn("+  return a + b;", diff_text)
         filtered = self.client.call_tool("git_diff", {"path": "package.json"})
         self.assertNotIn("src/math.js", self.tool_text(filtered))
+
+    def test_git_diff_shows_a_file_that_apply_patch_just_created(self) -> None:
+        add_file = """*** Begin Patch
+*** Add File: src/created.js
++export const created = true;
+*** End Patch
+"""
+        self.assert_tool_success(self.client.call_tool("apply_patch", {"patch": add_file}))
+        diff = self.client.call_tool("git_diff", {})
+        payload = self.assert_tool_success(diff)
+        self.assertIs(payload.get("include_untracked"), True)
+        diff_text = self.tool_text(diff)
+        self.assertIn("src/created.js", diff_text)
+        self.assertIn("+export const created = true;", diff_text)
+        paths = {entry.get("path") for entry in payload.get("files", [])}
+        self.assertIn("src/created.js", paths)
+
+        without = self.client.call_tool("git_diff", {"include_untracked": False})
+        without_payload = self.assert_tool_success(without)
+        self.assertIs(without_payload.get("include_untracked"), False)
+        self.assertNotIn("src/created.js", self.tool_text(without))
 
 
 def assert_search_entries_have_shape(testcase: ComplianceTestCase, payload: dict[str, Any]) -> None:

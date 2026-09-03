@@ -10,17 +10,19 @@ the handshake era `2025-11-25` with explicit compatibility for `2025-06-18`.
 
 This contract describes one stable, model-neutral coding tool set. There are no
 tool profiles and the server does not add or remove process tools dynamically.
-`apply_patch` is the only direct file-mutation primitive; `edit_file` is not
-provided. Permission modes alter command policy, not the advertised catalog.
+`apply_patch` and `apply_changes` are the direct file-mutation primitives;
+`edit_file` is not provided. Permission modes alter command policy and gate
+`request_permissions` in the advertised catalog: only `dangerous` mode
+advertises it, though its handler remains callable by name in every mode.
 
 One switch, `--dangerously-fake-readonly-annotations`, rewrites the exposure hints
 in `tools/list` for clients that refuse mutating tools by annotation. It is not a
-tool profile: the catalog, the schemas, and what every tool actually does are all
-unchanged, and no tool is hidden. It requires `dangerous` permission mode, requires
-authentication over HTTP, and is reported by `server_info.annotation_override` and
-the server card, both of which continue to publish the real annotations recorded
-below. Unless that switch is set, the annotations in this document are what
-`tools/list` returns.
+tool profile: within the selected permission mode, the catalog, the schemas, and
+what every tool actually does are unchanged, and the switch hides no tool. It
+requires `dangerous` permission mode, requires authentication over HTTP, and is
+reported by `server_info.annotation_override` and the server card, both of which
+continue to publish the real annotations recorded below. Unless that switch is
+set, the annotations in this document are what `tools/list` returns.
 
 ## Two protocol eras, one server
 
@@ -224,9 +226,16 @@ and bounded by file-count, scan-count, depth, per-file, and total-byte limits.
   workspace root. Absolute paths, `..` traversal, NUL bytes, and symlink
   escapes are rejected.
 - `apply_patch` parses and validates every operation before committing, under a
-  lock that spans every client, so two clients patching one file cannot lose
-  an update: the later one is answered with a conflict rather than silently
-  overwriting.
+  lock that spans every client of **one server process**, so two clients of that
+  process patching one file cannot lose an update: the later one is answered
+  with a conflict rather than silently overwriting.
+- That lock is an in-process mutex, not a file lock. Two server processes
+  pointed at one workspace do not exclude each other, and neither does an
+  external editor or a command started through `exec_command`. Across
+  processes the only protection is the pre-commit baseline recheck below: a
+  concurrent writer is detected and reported as `PATCH_CONFLICT`, but the
+  detection window is the interval between the recheck and `os.replace`, not
+  zero. Run one server per workspace if you need mutual exclusion.
 - Every replacement is prepared and fsynced in the target directory, then
   installed with `os.replace`.
 - Existing mode bits, UTF-8 BOMs, and CRLF/LF style are preserved. Moves inherit
@@ -293,11 +302,42 @@ Retry: This command_id has expired or never existed; …
 Known tool error codes include:
 
 ```json
-["ABSOLUTE_PATH_DENIED", "BINARY_FILE", "COMMAND_CLOSED", "COMMAND_LIMIT_REACHED", "COMMAND_NOT_FOUND", "ELICITATION_UNSUPPORTED", "GIT_ERROR", "INTERNAL_ERROR", "INVALID_ARGUMENT", "IS_DIRECTORY", "NOT_A_DIRECTORY", "NOT_FOUND", "OUTPUT_TOO_LARGE", "PATCH_CONFLICT", "PATCH_CONTEXT_AMBIGUOUS", "PATCH_CONTEXT_NOT_FOUND", "PATCH_FAILED", "PATCH_HUNKS_OVERLAP", "PATCH_ROLLBACK_FAILED", "PATH_OUTSIDE_WORKSPACE", "PERMISSION_REQUIRED", "RUNTIME_DIR_UNWRITABLE", "SANDBOX_UNAVAILABLE", "SYMLINK_ESCAPE", "TTY_UNSUPPORTED", "UNSUPPORTED_ENCODING"]
+["ABSOLUTE_PATH_DENIED", "BINARY_FILE", "COMMAND_CLOSED", "COMMAND_LIMIT_REACHED", "COMMAND_NOT_FOUND", "COMMAND_SPAWN_FAILED", "ELICITATION_UNSUPPORTED", "GIT_ERROR", "IDEMPOTENCY_KEY_REUSED", "INTERNAL_ERROR", "INVALID_ARGUMENT", "IS_DIRECTORY", "NOT_A_DIRECTORY", "NOT_FOUND", "OUTPUT_TOO_LARGE", "PATCH_CONFLICT", "PATCH_CONTEXT_AMBIGUOUS", "PATCH_CONTEXT_NOT_FOUND", "PATCH_FAILED", "PATCH_HUNKS_OVERLAP", "PATCH_ROLLBACK_FAILED", "PATH_OUTSIDE_WORKSPACE", "PERMISSION_REQUIRED", "REPEATED_CALL_BLOCKED", "REVISION_MISMATCH", "REVISION_REQUIRED", "RUNTIME_DIR_UNWRITABLE", "SANDBOX_UNAVAILABLE", "SYMLINK_ESCAPE", "TTY_UNSUPPORTED", "UNSUPPORTED_ENCODING"]
 ```
 
 Error categories are `validation`, `security`, `permission`, `runtime`,
 `not_found`, `conflict`, and `internal`.
+
+### Repeat-failure circuit breaker
+
+A call is fingerprinted by its tool name and its normalized arguments
+(`idempotency_key` excluded, since varying only that normally changes nothing
+the failure depended on). When the same fingerprint produces the same
+countable error code twice, the third attempt is refused with
+`REPEATED_CALL_BLOCKED` before the handler runs. The second failure already
+warns: its `details` carry `consecutive_identical_failures` and a `breaker`
+note. A success with the same arguments, or any change to the arguments, gives
+the revised call a fresh budget. A successful non-dry-run `apply_patch` or
+`apply_changes` clears all verdicts when it wrote, moved, copied, or deleted
+something; an already-applied result does not. The first terminal observation
+of each `command_id` from `exec_command`, `write_stdin`, `read_output`, or
+`kill_command` does the same whenever that particular command could have
+written to the tree: in unrestricted mode, under an unenforced structured-only
+policy, through a configured structured-only write path, or because its
+Landlock setup failed open and it ran unrestricted despite advertised host
+support. Later observations of the same completed command do not reset the
+breaker again.
+
+Countable means the repeat cannot work. Non-retryable failures count except
+`IDEMPOTENCY_KEY_REUSED`: that error specifically tells the caller to choose a
+new key, and keys are excluded from the work fingerprint, so counting it would
+block its own recovery. `PATCH_CONTEXT_NOT_FOUND`,
+`PATCH_CONTEXT_AMBIGUOUS`, `REVISION_MISMATCH`, and `REVISION_REQUIRED` also
+count. They are retryable in the sense that a *different* call can succeed —
+the fix is more context, a narrower scope, or a supplied/fresh `revision`, and
+the fingerprint proves a byte-identical retry carried none of them. Failures
+that depend on time rather than on the arguments — `PATCH_CONFLICT`,
+`COMMAND_LIMIT_REACHED` — never count toward it.
 
 Malformed JSON-RPC uses standard protocol errors: parse `-32700`, invalid
 request `-32600`, unknown method `-32601`, invalid params/tool `-32602`, and
@@ -326,6 +366,10 @@ output is truncated or a caller explicitly requested compact retained output.
 Its offsets are absolute and independent for stdout and stderr. A single
 truncated stream is selected by `next_action`; when both streams are truncated,
 `next_actions` contains one executable `read_output` call for each stream.
+Command results carry `operation_outcome`: `exited_0`, `exited_nonzero`,
+`timeout`, `signal`, `running`, or `spawn_error`. A `Popen` failure returns
+`COMMAND_SPAWN_FAILED` with the last outcome instead of advertising a state the
+runtime can never produce.
 
 A command belongs to the workspace, not to the client or the request that
 started it. Any authenticated client of the same workspace can continue, read,
@@ -380,13 +424,31 @@ per-session value and no runtime counter: there is no session, and how often a
 budget was hit is a property of the process rather than an answer to whichever
 client asked. Those counters travel with telemetry.
 
+`workspace_mutation_policy` reports who may write to the workspace: `mode` is
+`unrestricted` or `structured-only`, `write_paths` lists the directories that
+stay writable for commands under `structured-only`, `structured_write_tools`
+names the tools that write regardless, and `enforced` is `false` whenever
+`structured-only` lacks enabled Landlock ABI 3 or newer. ABIs 1–2 cannot deny
+truncate and therefore cannot provide the promised read-only workspace.
+Reporting validates configured in-workspace write directories without creating
+them. Missing directories are created only immediately before an
+`exec_command` installs its Landlock ruleset, so Landlock never silently skips
+a nonexistent allowlist root.
+`output_retention` reports the per-stream buffer budget alongside
+`completed_command_ttl_seconds` and `max_retained_completed_commands`, which
+together decide when a finished `command_id` stops answering.
+
 ### check_exec_environment
 
 Inputs: none.
 
 Annotations: `{"title":"Check exec environment","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
 
-Returns lightweight policy and Landlock status without running active probes.
+Returns lightweight policy and Landlock status without running active probes,
+including the same `workspace_mutation_policy` object `server_info` reports.
+Warnings cover an unavailable Landlock, a non-Linux host (where nothing
+confines a command's filesystem access), a `structured-only` policy that cannot
+be enforced, `permission_mode=dangerous`, and faked read-only annotations.
 
 ### read_file
 
@@ -397,6 +459,16 @@ Annotations: `{"title":"Read file","readOnlyHint":true,"destructiveHint":false,"
 Reads UTF-8 ranges as a stream, reports full file line/byte metadata, rejects
 binary content, and returns continuation metadata when bounded. The
 continuation repeats the workspace-relative path it was given.
+
+Every response carries `revision` and `revision_algorithm` (`"sha256"`).
+`revision` is the SHA-256 of the whole file's UTF-8 bytes, computed inside the
+same streaming pass that produced `content`, so it names the bytes this call
+decoded rather than a second, later read. It covers the entire file even when
+the response is a line range or is truncated: it identifies the file version,
+not the excerpt. It is also the value `apply_changes` requires, and it equals
+the `revision` `apply_patch` reports for the same bytes. The model-facing text
+opens with a `[Showing lines a-b of n revision=<hash>]` banner so a client that
+forwards only text can still supply it.
 
 ### list_dir
 
@@ -423,7 +495,7 @@ cap is known to be exceeded. `context_lines=0` does not reread matching files.
 
 ### apply_patch
 
-Inputs: `"patch"`, `"dry_run"`.
+Inputs: `"patch"`, `"dry_run"`, `"idempotency_key"`.
 
 Annotations: `{"title":"Apply patch","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}`.
 
@@ -439,6 +511,74 @@ Supports `*** Add File`, `*** Update File`, `*** Delete File`, and
 *** End Patch
 ```
 
+Hunk location, grading, idempotency, and the success/failure fields are
+specified once in [tools-and-schemas.md](tools-and-schemas.md#apply_patch).
+Several `*** Update File` blocks naming one path in one envelope chain in
+order: the second sees the first's result. `apply_patch` carries no
+`revision` argument — its context lines are its optimistic check.
+
+### apply_changes
+
+Inputs: `"changes"`, `"dry_run"`, `"idempotency_key"`.
+
+Annotations: `{"title":"Apply changes","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}`.
+
+Line-addressed sibling of `apply_patch`, committed through the same staging,
+baseline-recheck, and rollback machinery, and returning the same result shape.
+Nothing has to match: edits name line numbers instead of context.
+
+Each entry of `changes` carries an `action`, a `path`, and, for every action
+except `create`, the `revision` `read_file` published for that path:
+
+| action | requires | notes |
+| --- | --- | --- |
+| `create` | `content` | the path must not exist; `revision` is rejected |
+| `write` | `content`, `revision` when the path exists | upsert of the whole file |
+| `edit` | `edits`, `revision` | line operations, below |
+| `delete` | `revision` | file only, never a directory |
+| `move` | `destination`, `revision` | destination must not exist |
+| `copy` | `destination`, `revision` | source is verified, not written |
+
+`revision` is the SHA-256 of the file's UTF-8 bytes, identical to the value
+`read_file` and `apply_patch` report. A missing one is `REVISION_REQUIRED`; a
+stale one is `REVISION_MISMATCH`. Both carry the current revision, and both are
+retryable only after re-reading the file — a byte-identical retry is refused by
+the repeat-failure breaker. `apply_patch` deliberately has no equivalent check.
+
+Each entry of `edits` is one of:
+
+- `{"op": "replace", "start_line": n, "end_line": m, "content": "…"}`
+- `{"op": "delete", "start_line": n, "end_line": m}`
+- `{"op": "insert_after", "line": n, "content": "…"}` where `n` is in
+  `[0, total_lines]` and `0` inserts at the beginning
+- `{"op": "insert_before", "line": n, "content": "…"}` where `n` is in
+  `[1, total_lines + 1]` and `total_lines + 1` appends
+
+`end_line` is inclusive and defaults to `start_line`. Every line number refers
+to the file as `read_file` reported it, never to the result of an earlier edit
+in the same call, so the caller does not track its own shifts. Two edits that
+address the same lines — including two insertions at one point — are
+`PATCH_HUNKS_OVERLAP`. A line number past the end is `INVALID_ARGUMENT` with
+the file's `total_lines` in `details`.
+
+`content` is whole lines. `""` is **zero** lines, which is what makes `replace`
+with empty content a deletion; a trailing newline adds a blank line, so
+`"a\n"` is the two lines `a` and the empty line after it. There are no
+intra-line spans.
+
+A path may appear once per call, as `path` or as `destination`; a duplicate is
+`INVALID_ARGUMENT`. Paths are compared after they resolve, so `a.txt` and
+`./a.txt` are one path and naming both is the same error. Chaining several
+edits onto one file is `apply_patch`'s imperative territory. An empty `changes` array fails exactly as an empty patch
+does, with `PATCH_FAILED` and "No files were modified."
+
+The binding size limit is the 1 MiB HTTP request cap, not a change count. At
+most 100 changes and 200 edits per change are accepted as a guard against
+pathological input; roughly 20 files per call is the practical advice. A change
+whose result equals the file's current bytes is reported as `unchanged`, is
+committed as a baseline assertion rather than a rewrite, and sets
+`already_applied` when every change in the call is unchanged.
+
 ### exec_command
 
 Inputs: `"cmd"`, `"workdir"`, `"cwd"`, `"timeout_ms"`, `"yield_time_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`, `"stdin"`, `"tty"`, `"env"`.
@@ -449,6 +589,14 @@ Statuses are `exited`, `running`, `timeout`, `terminated`, or `failed`.
 Launch/policy failures use the error envelope with `status: "failed"`; signal
 exits use `terminated`. Ordinary non-zero exit codes still use `exited`.
 `"workdir"` is workspace-relative and defaults to the workspace root.
+
+`"yield_time_ms"` and `"timeout_ms"` are two separate budgets.
+`"yield_time_ms"` (default `10000`, maximum `30000`) is how long the call
+waits before returning; a command still running then keeps running under its
+`command_id`. `"timeout_ms"` (default `300000`, maximum `600000`) is the total
+process lifetime, after which the runtime kills the process group whether or
+not the call has already returned. Before v0.5.0 the lifetime defaulted to
+`30000`, so a command that outlived its first return was killed shortly after.
 
 Example: `{"cmd":"pytest -q","workdir":".","yield_time_ms":30000}`.
 
@@ -499,9 +647,17 @@ Annotations: `{"title":"Git status","readOnlyHint":true,"destructiveHint":false,
 
 ### git_diff
 
-Inputs: `"path"`, `"paths"`, `"staged"`, `"unstaged"`, `"context_lines"`, `"max_bytes"`.
+Inputs: `"path"`, `"paths"`, `"staged"`, `"unstaged"`, `"include_untracked"`, `"context_lines"`, `"max_bytes"`.
 
 Annotations: `{"title":"Git diff","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
+
+`"include_untracked"` defaults to `true`. Each untracked path reported by
+`git ls-files --others --exclude-standard` is diffed against an empty file and
+appended to the unstaged pass under the same truncation budget, so a file
+created by `*** Add File` is verifiable from `git_diff` alone. At most 100
+untracked files are diffed per call; the overflow is reported in `warnings`.
+Responses echo `include_untracked`. Setting `"unstaged": false` also disables
+the untracked pass.
 
 ### git_log
 
@@ -530,6 +686,11 @@ Annotations: `{"title":"Request permissions","readOnlyHint":true,"destructiveHin
 The current server does not advertise MCP elicitation. This tool therefore
 returns `ELICITATION_UNSUPPORTED`, except that dangerous mode reports the
 operator's explicit auto-grant policy. It never silently escalates safe mode.
+
+Because that answer is fixed outside dangerous mode, `tools/list` advertises
+`request_permissions` only when `permission_mode=dangerous`. The handler stays
+reachable: a client that calls it by name still gets the same answer it always
+got, in every mode. See [migration-0.5.md](migration-0.5.md).
 
 ### view_image
 

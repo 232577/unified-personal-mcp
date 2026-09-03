@@ -11,6 +11,10 @@ This tree owns deterministic dogfood and benchmark/regression harnesses.
   official SWE-bench harness when resources and real predictions are available.
 - `swebench/generate_reference_predictions.py` creates non-empty reference-patch
   JSONL files for GitHub Actions official-harness sanity checks.
+- `agent_eval/` runs real coding tasks with an external agent through its native
+  tools and through this MCP server, then scores both arms on pass rate,
+  first-attempt success, rounds to green, regressions, and wall time. See
+  [docs/agent-evaluation.md](../docs/agent-evaluation.md).
 
 The dogfood runner may start the server and prepare fixtures. It does not use
 direct filesystem, shell, or git operations for the coding loop after the MCP

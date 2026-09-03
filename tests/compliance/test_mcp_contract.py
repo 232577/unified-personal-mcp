@@ -25,6 +25,7 @@ from tests.compliance.mcp_client import (
     FORBIDDEN_TOOL_TERMS,
     MCPClient,
     MCPError,
+    MODE_GATED_TOOLS,
     REQUIRED_TOOLS,
     default_server_command,
     free_port,
@@ -236,6 +237,7 @@ class MCPContractTests(ComplianceTestCase):
             "list_files": (True, False, True, False),
             "search_text": (True, False, True, False),
             "apply_patch": (False, True, False, False),
+            "apply_changes": (False, True, False, False),
             "exec_command": (False, True, False, True),
             "write_stdin": (False, False, False, False),
             "kill_command": (False, True, False, False),
@@ -1503,8 +1505,12 @@ class MCPContractTests(ComplianceTestCase):
 
             tools = result.get("tools")
             self.assertIsInstance(tools, list)
-            self.assertEqual(len(tools), 18)
-            self.assertTrue({tool.get("name") for tool in tools} >= set(REQUIRED_TOOLS))
+            names = {tool.get("name") for tool in tools}
+            self.assertEqual(len(tools), len(REQUIRED_TOOLS))
+            self.assertTrue(names >= set(REQUIRED_TOOLS))
+            # Mode-gated tools are absent from a default catalog and still
+            # answer a client that calls them by name.
+            self.assertTrue(names.isdisjoint(MODE_GATED_TOOLS))
             for tool in tools:
                 # The cache hints describe the catalog, not the entries in it;
                 # a tool definition is a schema clients validate against.

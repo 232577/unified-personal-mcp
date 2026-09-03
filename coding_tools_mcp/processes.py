@@ -13,6 +13,11 @@ from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_tail
 
 
 COMMAND_BUFFER_BYTES = 524_288
+# The operation-level result of running a command, kept separate from the
+# transport-level "the tool call executed". A build that exits 1 is a
+# successful tool call and a failed operation; counting it as a success is how
+# telemetry came to report failed builds as wins.
+COMMAND_OUTCOMES = ("exited_0", "exited_nonzero", "timeout", "signal", "spawn_error", "running")
 # Fraction of the per-stream budget frozen as the head segment. The head keeps
 # the earliest output (command echo, first error) that a tail-only rolling
 # buffer would lose first, mirroring the head+tail retention used by other
@@ -126,6 +131,12 @@ class CommandRun:
     process: subprocess.Popen[bytes]
     timeout_at: float | None = None
     warnings: list[str] = field(default_factory=list)
+    # Facts about this command's launch, retained with its output so any
+    # terminal observer can decide whether the process could have changed the
+    # workspace. These describe the command that actually ran, not the
+    # server's advertised Landlock capability.
+    landlock_confined: bool = False
+    workspace_may_write: bool = True
     stdout: bytearray = field(default_factory=bytearray)
     stderr: bytearray = field(default_factory=bytearray)
     stdout_head: bytearray = field(default_factory=bytearray)
@@ -277,7 +288,10 @@ class CommandRun:
                 or stdout_omitted > 0
                 or stderr_omitted > 0
             ),
+            # The tool call itself executed; whether the command succeeded is
+            # `operation_outcome`, and only that is what telemetry counts.
             "ok": True,
+            "operation_outcome": command_outcome(status, self.exit_code, self.signal_name, self.timed_out),
         }
         warnings: list[str] = list(self.warnings)
         if stdout_truncation.truncated:
@@ -358,6 +372,18 @@ class CommandRun:
                     self.stderr_dropped_bytes,
                 )
         raise ValueError(f"Unknown output stream: {stream}")
+
+
+def command_outcome(status: str, exit_code: int | None, signal_name: str | None, timed_out: bool) -> str:
+    """Classify one command snapshot into a :data:`COMMAND_OUTCOMES` value."""
+
+    if timed_out or status == "timeout":
+        return "timeout"
+    if status == "running":
+        return "running"
+    if signal_name is not None or status == "terminated":
+        return "signal"
+    return "exited_0" if exit_code == 0 else "exited_nonzero"
 
 
 def start_reader_threads(command: CommandRun) -> None:

@@ -53,9 +53,8 @@ Risky capabilities return structured permission-required or unsupported response
 - `shell_expansion`
 - `inline_script`
 - `privileged_executable`
-- `write_generated_or_ignored`
 
-`request_permissions` currently returns `ELICITATION_UNSUPPORTED` unless a future MCP client elicitation flow is implemented and tested.
+`request_permissions` currently returns `ELICITATION_UNSUPPORTED` unless a future MCP client elicitation flow is implemented and tested. From 0.5.0 it is advertised only in `dangerous` mode; see [docs/permission-modes.md](docs/permission-modes.md).
 
 Operators should choose one of three permission modes:
 

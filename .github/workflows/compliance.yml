@@ -40,6 +40,9 @@ jobs:
       - name: Run unit discovery
         run: make test
 
+      - name: Run patch recovery repro gate
+        run: make test-patch-repro
+
       - name: Run protocol gate
         run: make test-protocol
 

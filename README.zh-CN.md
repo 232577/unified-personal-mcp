@@ -16,7 +16,7 @@ Coding Tools MCP 是一个**模型中立的编程运行时**，通过
 文件读取与搜索、结构化多文件补丁、命令执行、交互式命令、git 操作——
 一个服务器，任何 MCP 客户端都能驱动。Claude Desktop、Claude Code、Codex、
 Cursor、Cline、VS Code、Windsurf、Gemini CLI，或你自己写的 agent，拿到的
-都是同一套久经考验的 18 个工具：限定在单一工作区内，由权限模式层层把关。
+都是默认目录中久经考验的 18 个工具：限定在单一工作区内，由权限模式层层把关。
 
 [![观看演示](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
 
@@ -28,8 +28,8 @@ Cursor、Cline、VS Code、Windsurf、Gemini CLI，或你自己写的 agent，�
   绝对路径、`..` 穿越、符号链接逃逸一律拒绝；权限模式对网络访问、shell
   展开、内联脚本和破坏性命令逐项把关；Linux 上还有
   [Landlock](docs/security-boundary.md) 提供内核级文件系统隔离。
-- **模型与厂商中立。** 固定且如实标注的工具目录——没有 profile 切换，
-  没有注解把戏。随意更换模型或客户端，运行时行为保持不变。
+- **模型与厂商中立。** 如实标注、感知权限模式的工具目录——没有 profile
+  切换，没有注解把戏。随意更换模型或客户端，运行时契约保持不变。
 - **为上下文窗口精打细算。** 工具结果按设计做摘要、分页与封顶；在确定性
   dogfood 工作负载上，序列化结果字节数相比上一版本下降 37%，任务完成率不变。
 
@@ -121,14 +121,15 @@ coding-tools-mcp-desktop
 
 ## 工具目录
 
-一套稳定且如实标注的目录——权限模式改变的是命令*策略*，而不是模型看到哪些
-工具。`apply_patch` 是唯一的文件修改原语：分阶段、基线校验、跨文件原子提交、
-支持回滚。
+注册表包含 19 个如实标注的工具。默认的 `safe` 与 `trusted` 模式对外声明
+18 个；`dangerous` 还会声明 `request_permissions`，也只有该模式下这个工具
+才能授予权限。`apply_patch` 与 `apply_changes` 都是文件修改原语：分阶段、
+基线校验、跨文件原子提交并支持回滚。
 
 | 分组 | 工具 |
 | --- | --- |
-| 文件与搜索 | `read_file` · `list_dir` · `list_files` · `search_text` · `apply_patch` · `view_image` |
-| 执行 | `exec_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions` |
+| 文件与搜索 | `read_file` · `list_dir` · `list_files` · `search_text` · `apply_patch` · `apply_changes` · `view_image` |
+| 执行 | `exec_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions`（仅 `dangerous`） |
 | Git | `git_status` · `git_diff` · `git_log` · `git_show` · `git_blame` |
 | 运行时 | `server_info` · `check_exec_environment` |
 

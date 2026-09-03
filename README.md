@@ -16,8 +16,8 @@ Coding Tools MCP is a **model-neutral coding runtime** served over the
 search, structured multi-file patches, command execution, interactive
 sessions, and git — one server that any MCP client can drive. Claude Desktop,
 Claude Code, Codex, Cursor, Cline, VS Code, Windsurf, Gemini CLI, or an agent
-you build yourself all get the same 18 battle-tested tools, confined to one
-workspace, gated by permission modes.
+you build yourself gets the default catalog of 18 battle-tested tools, confined
+to one workspace and gated by permission modes.
 
 [![Watch the demo](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
 
@@ -31,9 +31,9 @@ workspace, gated by permission modes.
   Permission modes gate network access, shell expansion, inline scripts, and
   destructive commands. On Linux, [Landlock](docs/security-boundary.md) adds
   kernel-level filesystem confinement.
-- **It is model- and vendor-neutral.** A fixed, truthfully annotated catalog —
-  no profile switching, no annotation games. Swap models or clients freely;
-  the runtime and its behavior stay put.
+- **It is model- and vendor-neutral.** A truthfully annotated, mode-aware
+  catalog — no profile switching, no annotation games. Swap models or clients
+  freely; the runtime contract stays put.
 - **It is engineered for context windows.** Results are summarized, paginated,
   and capped by design; serialized tool-result bytes dropped 37%
   release-over-release on the deterministic dogfood workload with unchanged
@@ -133,15 +133,16 @@ speak MCP to this server and inherit the whole safety boundary. →
 
 ## The tool catalog
 
-One stable, truthfully annotated set — permission modes change command
-*policy*, never which tools the model sees. `apply_patch` is the sole
-file-mutation primitive: staged, baseline-checked, atomic across files, with
-rollback.
+The registry contains 19 truthfully annotated tools. The default `safe` and
+`trusted` modes advertise 18; `dangerous` also advertises
+`request_permissions`, the only mode in which that tool can grant anything.
+`apply_patch` and `apply_changes` are the file-mutation primitives: both are
+staged, baseline-checked, atomic across files, and support rollback.
 
 | Group | Tools |
 | --- | --- |
-| Files & search | `read_file` · `list_dir` · `list_files` · `search_text` · `apply_patch` · `view_image` |
-| Execution | `exec_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions` |
+| Files & search | `read_file` · `list_dir` · `list_files` · `search_text` · `apply_patch` · `apply_changes` · `view_image` |
+| Execution | `exec_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions` (`dangerous` only) |
 | Git | `git_status` · `git_diff` · `git_log` · `git_show` · `git_blame` |
 | Runtime | `server_info` · `check_exec_environment` |
 
