@@ -30,7 +30,7 @@ def _wrap_upstream_tool(mcp, parent, *, store, lease):
 
 
 def build_mcp(*, state_root, allowed_root, apps_dir=None, controller_factory=None,
-              browser_config_path=None):
+              browser_config_path=None, full_control=False):
     from fastmcp import FastMCP
     from windows_mcp.tools import register_all
     from bf_automation.bf_tools import register_bf_tools
@@ -58,7 +58,8 @@ def build_mcp(*, state_root, allowed_root, apps_dir=None, controller_factory=Non
     initial = {t.name: t for t in asyncio.run(mcp.list_tools())}
     for name in initial.keys() - permitted:
         mcp._local_provider.remove_tool(name)
-    store, lease = TaskStore(state, allowed_root=allowed), DesktopLease()
+    store = TaskStore(state, allowed_root=allowed, allow_external_projects=full_control)
+    lease = DesktopLease()
     for name in sorted(permitted):
         _wrap_upstream_tool(mcp, initial[name], store=store, lease=lease)
     register_bf_tools(mcp, store=store, lease=lease, allowed_root=allowed, apps_dir=apps,

@@ -18,7 +18,7 @@ def definition(name, description, properties, required, output, *, readonly=Fals
                             "idempotentHint": False, "openWorldHint": False}}
 
 
-def unified_catalog(bf_server):
+def unified_catalog(bf_server, *, full_control=False):
     tools = {name: deepcopy(tool_definition(name)) for name in TOOL_REGISTRY}
     for tool in asyncio.run(bf_server.list_tools()):
         if tool.name in {"task_context", "task_diagnostics"}:
@@ -44,6 +44,12 @@ def unified_catalog(bf_server):
         schema["required"] = list(dict.fromkeys([*schema.get("required", []), "workflow_id"]))
         schema["additionalProperties"] = False
         tool["description"] = "Requires an active UnifiedTask workflow. " + tool["description"]
+        if full_control and name in TOOL_REGISTRY:
+            tool["description"] += (
+                " This installation is owner-authorized for full local control: absolute paths and paths "
+                "outside the default project are permitted with the Windows user's access. "
+                "For shared build tools, keep the target project workdir and pass the tool's absolute path. "
+                "Set workdir explicitly on each command; it does not change other workflows.")
         if not tool["annotations"].get("readOnlyHint", False) and not name.startswith("Browser"):
             schema["properties"]["request_id"] = deepcopy(TEXT)
             schema["required"] = list(dict.fromkeys([*schema["required"], "request_id"]))

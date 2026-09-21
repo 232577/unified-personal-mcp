@@ -12,9 +12,11 @@ from pathlib import Path
 
 
 class TaskStore:
-    def __init__(self, state_root: str | Path, *, allowed_root: str | Path):
+    def __init__(self, state_root: str | Path, *, allowed_root: str | Path,
+                 allow_external_projects: bool = False):
         self.state_root = Path(state_root).resolve()
         self.allowed_root = Path(allowed_root).resolve()
+        self.allow_external_projects = allow_external_projects
         self.tasks_root = self.state_root / "tasks"
         self.tasks_root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -49,10 +51,11 @@ class TaskStore:
 
     def _project_path(self, project_path: str | Path) -> Path:
         project = Path(project_path).resolve()
-        try:
-            project.relative_to(self.allowed_root)
-        except ValueError as exc:
-            raise ValueError(f"project path must stay inside allowed root {self.allowed_root}") from exc
+        if not self.allow_external_projects:
+            try:
+                project.relative_to(self.allowed_root)
+            except ValueError as exc:
+                raise ValueError(f"project path must stay inside allowed root {self.allowed_root}") from exc
         if not project.is_dir():
             raise ValueError(f"project path is not a directory: {project}")
         return project

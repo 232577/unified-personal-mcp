@@ -57,7 +57,8 @@ class SetupWindow:
         for row, (label, name) in enumerate(rows, start=3):
             ttk.Label(page, text=label).grid(row=row, column=0, sticky="w", padx=(0, 18), pady=6)
             if name in {"key_source", "permission_mode"}:
-                options = ("密钥文件", "环境变量") if name == "key_source" else ("允许项目内执行", "限制执行")
+                options = (("密钥文件", "环境变量") if name == "key_source"
+                           else ("允许项目内执行", "限制执行", "完全控制本机"))
                 entry = ttk.Combobox(page, textvariable=self.values[name], values=options, state="readonly")
             else:
                 entry = ttk.Entry(page, textvariable=self.values[name])
@@ -67,7 +68,7 @@ class SetupWindow:
                 button = ttk.Button(page, text="选择", command=lambda n=name: self.choose(n))
                 button.grid(row=row, column=2, padx=(8, 0), pady=6)
                 self.fields.append((button, "normal"))
-        ttk.Label(page, text="每个任务选择项目父目录下的具体项目。私有数据目录请放在项目父目录之外。",
+        ttk.Label(page, text="任务分别管理进程和浏览器。完全控制模式允许跨目录读写及调用外部工具，权限等同当前 Windows 用户。",
             wraplength=710, foreground="#596579").grid(row=11, column=0, columnspan=3, sticky="w", pady=(10, 12))
         actions = ttk.Frame(page)
         actions.grid(row=12, column=0, columnspan=3, sticky="ew")
@@ -107,7 +108,8 @@ class SetupWindow:
                     data_root=str(cfg.data_root), tunnel_id=cfg.tunnel_id, port=str(cfg.port),
                     key_source="环境变量" if cfg.tunnel_key_env else "密钥文件",
                     key=cfg.tunnel_key_env or str(cfg.tunnel_key_file),
-                    permission_mode="允许项目内执行" if cfg.permission_mode == "trusted" else "限制执行")
+                    permission_mode={"trusted": "允许项目内执行", "safe": "限制执行",
+                                     "full_control": "完全控制本机"}[cfg.permission_mode])
             except Exception:
                 self.show("已有配置未通过检查，请重新填写后保存。")
         for name, value in defaults.items():
@@ -139,7 +141,8 @@ class SetupWindow:
         return {"schema_version": 1, "workspace_root": values["workspace_root"],
                 "data_root": values["data_root"], "device_label": values["device_label"],
                 "port": int(values["port"]), "host": "127.0.0.1", "tunnel": tunnel,
-                "permission_mode": "trusted" if values["permission_mode"] == "允许项目内执行" else "safe"}, key_import
+                "permission_mode": {"允许项目内执行": "trusted", "限制执行": "safe",
+                                    "完全控制本机": "full_control"}[values["permission_mode"]]}, key_import
 
     def show(self, text):
         self.feedback.configure(state="normal")

@@ -19,6 +19,14 @@ class AppConfig:
     device_label: str = "My development PC"
     tunnel_key_env: str | None = None
 
+    @property
+    def full_control(self) -> bool:
+        return self.permission_mode == "full_control"
+
+    @property
+    def runtime_permission_mode(self) -> str:
+        return "dangerous" if self.full_control else self.permission_mode
+
     def project(self, value: str) -> Path:
         if not isinstance(value, str) or not value.strip():
             raise ValueError("project must name an existing child directory")
@@ -26,7 +34,9 @@ class AppConfig:
             target = (self.workspace_root / value).resolve(strict=True)
         except OSError as exc:
             raise ValueError("project must name an existing directory") from exc
-        if (target == self.workspace_root or not target.is_dir()
+        if not target.is_dir():
+            raise ValueError("project must name an existing directory")
+        if not self.full_control and (target == self.workspace_root
                 or not target.is_relative_to(self.workspace_root)):
             raise ValueError("project must be a strict child of workspace_root")
         return target
@@ -67,8 +77,8 @@ def load_config(path: str | Path) -> AppConfig:
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
     mode = raw.get("permission_mode", "safe")
-    if mode not in {"safe", "trusted"}:
-        raise ValueError("permission_mode must be safe or trusted")
+    if mode not in {"safe", "trusted", "full_control"}:
+        raise ValueError("permission_mode must be safe, trusted or full_control")
     tunnel = raw["tunnel"]
     _fields(tunnel, {"id", "key_file", "key_env"}, {"id"})
     if ("key_file" in tunnel) == ("key_env" in tunnel):

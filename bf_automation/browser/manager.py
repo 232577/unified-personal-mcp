@@ -106,7 +106,9 @@ class BrowserManager:
         directory, task = self._task(token)
         from ..application_registry import project_profiles
         profiles = project_profiles(self.store, token, self.apps_dir, application_id)
-        registered = load_browser_profile(profiles, application_id, self.store.allowed_root)
+        profile_scope = (Path(task['project_path']).resolve().parent
+                         if self.store.allow_external_projects else self.store.allowed_root)
+        registered = load_browser_profile(profiles, application_id, profile_scope)
         hybrid_profile = registered if isinstance(registered, HybridProfile) else None
         profile = hybrid_profile.web if hybrid_profile is not None else registered
         if profile.project_root != Path(task['project_path']).resolve():

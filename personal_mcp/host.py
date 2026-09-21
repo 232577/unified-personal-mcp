@@ -13,6 +13,7 @@ from . import __version__
 from .bf.executor import BFExecutor
 from .catalog import unified_catalog
 from .coding import LocalTelemetry, build_coding
+from .full_control import FullControlProjectContext
 from .operations import OperationJournal
 from .search import SearchManager
 from .workflows import AuthPrincipal, WorkflowError, WorkflowRegistry
@@ -69,10 +70,12 @@ class UnifiedRuntime(Runtime):
             "Begin UnifiedTask for a concrete project, keep the one-time workflow_id and activate it. "
             "Pass workflow_id to coding and desktop tools. Read project instructions before edits. "
             "Prefer Window tools for desktop work. Observe unknown outcomes; do not replay. End the workflow when done.", False),), (), ())
-        super().__init__(config.workspace_root, auth_token=auth_token, permission_mode=config.permission_mode,
+        if config.full_control:
+            context = FullControlProjectContext(context.root_files, context.nested_files, context.warnings)
+        super().__init__(config.workspace_root, auth_token=auth_token, permission_mode=config.runtime_permission_mode,
                          project_context=context, transport="http")
         self.telemetry = LocalTelemetry()
-        self.catalog = unified_catalog(bf_server)
+        self.catalog = unified_catalog(bf_server, full_control=config.full_control)
         self.validators = {k: Draft202012Validator(v["inputSchema"]) for k, v in self.catalog.items()}
         self._exposed_tool_names = list(self.catalog)
         self._exposed_tool_name_set = frozenset(self.catalog)
@@ -102,7 +105,15 @@ class UnifiedRuntime(Runtime):
             self.validators[name].validate(arguments)
             args = dict(arguments)
             if name == "server_info":
-                return tool_result({**self.server_info_payload(), "ok": True, "device_label": self.config.device_label})
+                info = self.server_info_payload()
+                if self.config.full_control:
+                    info["exec_policy"]["secret_env_filter"] = "enabled"
+                return tool_result({**info, "ok": True, "server": "unified-personal-mcp",
+                    "title": "Unified Personal MCP", "version": __version__,
+                    "device_label": self.config.device_label, "permission_mode": self.config.permission_mode,
+                    "filesystem_scope": "current_windows_user" if self.config.full_control else "workflow_project",
+                    "absolute_paths_allowed": self.config.full_control,
+                    "working_directory": "Set exec_command.workdir per call; other workflows are unchanged."})
             if name == "UnifiedTask":
                 action = args.pop("action")
                 if action == "begin":

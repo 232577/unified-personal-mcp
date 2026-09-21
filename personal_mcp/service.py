@@ -58,7 +58,8 @@ class LocalService:
                 "browsers_path": str(self.assets / "browsers"),
                 "actions_enabled": True, "transfers_enabled": True}), encoding="utf-8")
             bf = build_mcp(state_root=self.config.data_root / "bf", allowed_root=self.config.workspace_root,
-                           apps_dir=self.config.data_root / "apps", browser_config_path=browser_config)
+                           apps_dir=self.config.data_root / "apps", browser_config_path=browser_config,
+                           full_control=self.config.full_control)
             rg = self.assets / "bin" / "rg.exe"
             self.runtime = UnifiedRuntime(self.config, auth_token=key, bf_server=bf,
                                           rg_path=rg if rg.is_file() else None)
