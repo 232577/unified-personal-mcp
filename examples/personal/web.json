@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "id": "web",
+  "kind": "web",
+  "project_root": "../..",
+  "entry_url": "http://127.0.0.1:5173",
+  "navigation_origins": [
+    "http://127.0.0.1:5173"
+  ],
+  "resource_origins": [
+    "http://127.0.0.1:5173"
+  ],
+  "transfer": {
+    "upload_roots": [
+      "inputs"
+    ]
+  }
+}
+

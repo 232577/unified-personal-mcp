@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "id": "native",
+  "kind": "desktop",
+  "adapter": "window",
+  "launcher": {
+    "executable": "../../build/MyApp.exe",
+    "args": [],
+    "cwd": "../..",
+    "reuse_existing": false
+  },
+  "window": {
+    "title_contains": "My application"
+  }
+}
+

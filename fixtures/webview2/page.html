@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN" data-bf-hybrid-instance="">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>U4A WebView2 Fixture</title>
+  <style>
+    body{font-family:Segoe UI,Microsoft YaHei,sans-serif;margin:32px;max-width:760px}
+    label{display:block;margin:14px 0} input,select,button{font:inherit;padding:8px}
+    [data-testid$="-result"]{margin:12px 0;padding:10px;background:#f2f2f2}
+  </style>
+</head>
+<body>
+  <h1 data-testid="workbench">U4A WebView2 混合工作台</h1>
+  <label>记录名称 <input data-testid="record-name" aria-label="记录名称"></label>
+  <label>类别 <select data-testid="category" aria-label="类别"><option value="quality">quality</option><option value="ops">ops</option></select></label>
+  <label><input type="checkbox" data-testid="confirmed"> 确认</label>
+  <button data-testid="save">保存网页记录</button>
+  <div data-testid="result">尚未保存</div>
+  <label>附件 <input type="file" data-testid="attachment"></label>
+  <button data-testid="upload-submit">确认附件</button>
+  <div data-testid="upload-result">尚未上传</div>
+  <a data-testid="download" download="u4a-report.txt" href="/download">下载网页报告</a>
+  <button data-testid="export">导出到...</button>
+  <div data-testid="export-result">尚未导出</div>
+  <div data-testid="cookie-result"></div>
+  <div data-testid="storage-result"></div>
+  <script>
+    const instance=new URLSearchParams(location.search).get('instance')||'';
+    document.documentElement.dataset.bfHybridInstance=instance;
+    document.querySelector('[data-testid=download]').href='/download?instance='+encodeURIComponent(instance);
+    document.cookie='u4a_instance='+encodeURIComponent(instance)+'; path=/';
+    document.querySelector('[data-testid=cookie-result]').textContent='cookie:'+document.cookie;
+    localStorage.setItem('u4a_state',instance);
+    document.querySelector('[data-testid=storage-result]').textContent='storage:'+localStorage.getItem('u4a_state');
+    document.querySelector('[data-testid=save]').onclick=()=>{
+      const n=document.querySelector('[data-testid=record-name]').value;
+      const c=document.querySelector('[data-testid=category]').value;
+      const ok=document.querySelector('[data-testid=confirmed]').checked;
+      document.querySelector('[data-testid=result]').textContent=`saved:${instance}:${n}:${c}:${ok}`;
+    };
+    document.querySelector('[data-testid=upload-submit]').onclick=()=>{
+      const f=document.querySelector('[data-testid=attachment]').files[0];
+      document.querySelector('[data-testid=upload-result]').textContent=f?`uploaded:${f.name}:${f.size}`:'no-file';
+    };
+    document.querySelector('[data-testid=export]').onclick=async()=>{
+      const selected=await pywebview.api.choose_export_path();
+      if(!selected||selected.cancelled){
+        document.querySelector('[data-testid=export-result]').textContent='cancelled';
+        return;
+      }
+      const done=await pywebview.api.complete_export(selected.path);
+      document.querySelector('[data-testid=export-result]').textContent=done.ok?`exported:${done.filename}`:'failed';
+    };
+  </script>
+</body>
+</html>
+
+

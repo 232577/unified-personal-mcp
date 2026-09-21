@@ -1,228 +1,46 @@
-# Coding Tools MCP
+# Unified Personal MCP
 
-**English** | [简体中文](README.zh-CN.md)
+一个可配置的 Windows 程序，把编码、桌面、Chromium 和 WebView2 操作放到同一个 MCP 接口，通过 **OpenAI Secure MCP Tunnel** 连接自己的开发机。
 
-> Give any AI chat or agent a safe pair of hands on your codebase.
+组合的职责：
 
-[![PyPI](https://img.shields.io/pypi/v/coding-tools-mcp)](https://pypi.org/project/coding-tools-mcp/)
-[![npm](https://img.shields.io/npm/v/coding-tools-mcp)](https://www.npmjs.com/package/coding-tools-mcp)
-[![Python](https://img.shields.io/pypi/pyversions/coding-tools-mcp)](https://pypi.org/project/coding-tools-mcp/)
-[![compliance](https://github.com/xyTom/coding-tools-mcp/actions/workflows/compliance.yml/badge.svg)](https://github.com/xyTom/coding-tools-mcp/actions/workflows/compliance.yml)
-[![release](https://github.com/xyTom/coding-tools-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/xyTom/coding-tools-mcp/actions/workflows/release.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-
-Coding Tools MCP is a **model-neutral coding runtime** served over the
-[Model Context Protocol](https://modelcontextprotocol.io): file reading and
-search, structured multi-file patches, command execution, interactive
-sessions, and git — one server that any MCP client can drive. Claude Desktop,
-Claude Code, Codex, Cursor, Cline, VS Code, Windsurf, Gemini CLI, or an agent
-you build yourself gets the default catalog of 18 battle-tested tools, confined
-to one workspace and gated by permission modes.
-
-[![Watch the demo](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
-
-## Why people use it
-
-- **It turns a chat app into a coding agent.** Claude Desktop — or any MCP
-  chat client — gets real repo access with the subscription you already have.
-  No extra product required.
-- **Safety is the product, not an afterthought.** One workspace root per
-  server. Absolute paths, `..` traversal, and symlink escapes are rejected.
-  Permission modes gate network access, shell expansion, inline scripts, and
-  destructive commands. On Linux, [Landlock](docs/security-boundary.md) adds
-  kernel-level filesystem confinement.
-- **It is model- and vendor-neutral.** A truthfully annotated, mode-aware
-  catalog — no profile switching, no annotation games. Swap models or clients
-  freely; the runtime contract stays put.
-- **It is engineered for context windows.** Results are summarized, paginated,
-  and capped by design; serialized tool-result bytes dropped 37%
-  release-over-release on the deterministic dogfood workload with unchanged
-  task completion.
-
-## Quickstart
-
-Run it with whichever toolchain you already have (the server is Python ≥ 3.11
-from PyPI; the npm package is a thin launcher that starts it via `uv` or
-`pipx`):
-
-```bash
-uvx coding-tools-mcp --stdio --workspace /path/to/repo   # Python toolchain
-npx coding-tools-mcp --stdio --workspace /path/to/repo   # Node toolchain
-```
-
-Wire it into Claude Desktop, Claude Code, Codex, Cursor, VS Code, Windsurf,
-Gemini CLI, or Cline — the JSON is the same everywhere (swap `uvx` for `npx`
-if you prefer Node):
-
-```json
-{
-  "mcpServers": {
-    "coding-tools": {
-      "command": "uvx",
-      "args": ["coding-tools-mcp", "--stdio", "--workspace", "/path/to/repo"]
-    }
-  }
-}
-```
-
-Then ask your client: *"run the test suite and fix the first failure."*
-
-Prefer HTTP? Drop `--stdio` and the server speaks Streamable HTTP on
-`http://127.0.0.1:8765/mcp`. Both protocol eras are served on either
-transport: MCP `2026-07-28` in full, with `tools` as the only advertised
-capability, and the handshake era `2025-11-25` with `2025-06-18`
-compatibility. Neither has sessions. A one-line installer, per-client
-walkthroughs, and troubleshooting live in
-[docs/quickstart.md](docs/quickstart.md) and
-[docs/mcp-client-config.md](docs/mcp-client-config.md).
-
-## Seven things to try
-
-**1. Make Claude Desktop your coding agent.** The config above is all it
-takes — the chat window you already pay for can now read, patch, test, and
-commit-review a real repository.
-
-**2. Code on your own machine from anywhere.**
-
-```bash
-CODING_TOOLS_MCP_AUTH_MODE=bearer ./integrations/tunnels/tunnel.sh cloudflared /path/to/repo
-```
-
-Loopback bind + authenticated HTTPS tunnel (`cloudflared`, `ngrok`, or
-Microsoft Dev Tunnel). Point claude.ai on your phone at
-`https://<tunnel-host>/mcp` and drive your home workstation from anywhere.
-ChatGPT and Grok connect through their connector settings the same way.
-Bearer tokens and OAuth 2.1 + PKCE (with RFC 7591 dynamic registration) are
-built in. → [docs/remote-mcp.md](docs/remote-mcp.md)
-
-**3. Let an agent loose on untrusted code — inside a disposable sandbox.**
-
-```bash
-docker build -t coding-tools-mcp-sandbox:local .
-docker run --rm --init -it -p 8765:8765 -v "$PWD:/workspace" coding-tools-mcp-sandbox:local
-```
-
-A containerized server with toolchains and caches preconfigured, safe to point
-at a sketchy PR and destroy afterwards. → [docs/docker.md](docs/docker.md)
-
-**4. Spin up a cloud sandbox with one MCP call.** The bundled
-[Cloudflare Worker control plane](infra/cloudflare/sandbox-control/README.md) exposes
-`start_coding_tools_sandbox` as an MCP tool: one call dispatches a GitHub
-Actions runner that boots the Docker sandbox and publishes it behind an
-authenticated Cloudflare Tunnel. Ephemeral compute, no server of your own.
-
-**5. Drive it from a GUI.**
-
-```bash
-python -m pip install "coding-tools-mcp[desktop]"
-coding-tools-mcp-desktop
-```
-
-Per-workspace profiles, server and tunnel start/stop, credential setup with
-clipboard helpers, live health checks. English and 简体中文.
-
-**6. Keep an interactive command alive.** `exec_command` starts a REPL or
-debugger under a real PTY; `write_stdin` feeds it across turns; `read_output`
-pages long output; `kill_command` cleans up. Long-running processes are
-first-class, with deadline watchdogs and bounded buffers.
-
-**7. Give your own agent production-grade hands.** Building an agent loop with
-the Anthropic SDK or anything else? Don't hand-roll file and exec tools —
-speak MCP to this server and inherit the whole safety boundary. →
-[docs/embedding.md](docs/embedding.md)
-
-## The tool catalog
-
-The registry contains 19 truthfully annotated tools. The default `safe` and
-`trusted` modes advertise 18; `dangerous` also advertises
-`request_permissions`, the only mode in which that tool can grant anything.
-`apply_patch` and `apply_changes` are the file-mutation primitives: both are
-staged, baseline-checked, atomic across files, and support rollback.
-
-| Group | Tools |
+| 组件 | 在本项目中的用途 |
 | --- | --- |
-| Files & search | `read_file` · `list_dir` · `list_files` · `search_text` · `apply_patch` · `apply_changes` · `view_image` |
-| Execution | `exec_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions` (`dangerous` only) |
-| Git | `git_status` · `git_diff` · `git_log` · `git_show` · `git_blame` |
-| Runtime | `server_info` · `check_exec_environment` |
+| coding-tools-mcp | 原有 HTTP/MCP 协议、认证与 18 个编码工具 |
+| BF | 窗口操作、独立浏览器、WebView2、工作流资源管理 |
+| DesktopCommanderMCP | 借用 MIT 源码中的 PATHEXT 修复与渐进搜索设计 |
+| OpenAI tunnel-client | 唯一远程连接通道 |
 
-Root `AGENTS.md`/`CLAUDE.md` files load automatically and come back in the
-`instructions` of `initialize`, or of `server/discover` for a client that
-never handshakes. Tool `content` is concise agent-facing text;
-`structuredContent` carries the complete machine result. Schemas and result
-envelopes: [docs/tools-and-schemas.md](docs/tools-and-schemas.md) ·
-[docs/runtime-contract-v0.3.md](docs/runtime-contract-v0.3.md).
+统一接口含 49 个工具。每个工作流选择一个具体项目，拥有自己的编码进程、搜索、浏览器和由它启动的应用。结束时释放这些资源；附加到已有应用时保留原应用。
 
-## Safety Boundary
+## 快速开始
 
-| Mode | Meant for | What it allows |
-| --- | --- | --- |
-| `safe` (default) | day-to-day agent work | file tools and vetted commands; network-looking commands, shell expansion, inline scripts, and destructive commands all require explicit permission |
-| `trusted` | local development | opens network, shell expansion, and inline scripts; keeps secret filtering and destructive-command checks |
-| `dangerous` | isolated containers/VMs only | disables `exec_command` permission gates; workspace path boundaries still apply |
+Windows x64、CPython 3.13.14：
 
-Recursive listing and search exclude `.git`, `node_modules`, build outputs,
-virtualenvs, and caches. Commands run with workspace-bound cwd, scrubbed
-environment, timeouts, and output caps. Linux hosts with Landlock get
-kernel-enforced filesystem confinement; other platforms get an explicit
-warning — this is still not a complete OS sandbox, so use the Docker image or
-a VM for genuinely untrusted work. Details:
-[SECURITY.md](SECURITY.md) · [docs/security-boundary.md](docs/security-boundary.md) ·
-[docs/permission-modes.md](docs/permission-modes.md)
-
-## Telemetry
-
-The server sends anonymous usage telemetry (per-tool success/latency counters
-and version/platform dimensions — never paths, arguments, commands, or file
-contents) to help prioritize fixes. Disable it with
-`CODING_TOOLS_MCP_TELEMETRY=off` or `DO_NOT_TRACK=1`; it is automatically off
-in CI. `CODING_TOOLS_MCP_TELEMETRY=debug` prints every event to stderr instead
-of sending. The full event list and guarantees are in
-[docs/telemetry.md](docs/telemetry.md).
-
-## Evidence, Dogfood and SWE-bench
-
-Every release ships through a tag-triggered pipeline in which the compliance
-suite, real-workload benchmark, and SWE-bench harness run from the same commit
-that publishes to PyPI and npm — both via trusted publishing, npm with
-provenance. Dogfood efficiency metrics are reproducible (`make dogfood-smoke`)
-and checked in under `reports/`. This repository does not claim a
-model-generated SWE-bench leaderboard result — see
-[docs/swe-bench.md](docs/swe-bench.md) for exactly what is and is not
-measured. More: [COMPLIANCE.md](COMPLIANCE.md) · [BENCHMARK.md](BENCHMARK.md) ·
-[docs/dogfood.md](docs/dogfood.md)
-
-## Documentation
-
-| | |
-| --- | --- |
-| Documentation map | [Browse docs by topic](docs/README.md) |
-| Getting started | [Quickstart](docs/quickstart.md) · [Client configuration](docs/mcp-client-config.md) · [Troubleshooting](docs/troubleshooting.md) |
-| Remote & sandboxed | [Remote MCP](docs/remote-mcp.md) · [Docker sandbox](docs/docker.md) · [Cloud sandbox worker](infra/cloudflare/sandbox-control/README.md) |
-| Tools & contract | [Tools and schemas](docs/tools-and-schemas.md) · [Runtime contract](docs/runtime-contract-v0.3.md) · [Migrating to 0.3](docs/migration-0.3.md) · [Permission modes](docs/permission-modes.md) |
-| Execution | [Exec recipes](docs/exec-command-recipes.md) · [Exec troubleshooting](docs/troubleshooting-exec.md) |
-| Integration | [Embedding](docs/embedding.md) · [npm launcher](packages/npm-launcher/README.md) |
-| Security & quality | [Security policy](SECURITY.md) · [Security boundary](docs/security-boundary.md) · [CI and tests](docs/ci-and-tests.md) · [Limitations](docs/limitations.md) · [Competitive analysis](docs/competitive-analysis.md) |
-
-## Development
-
-```bash
-python -m pip install -e ".[dev]"
-make ci        # lint, typecheck, tests, protocol/integration suites, gates
+```powershell
+python -m venv .venv-host
+.venv-host\Scripts\python.exe -m pip install -r requirements-windows.lock
+.venv-host\Scripts\python.exe -m pip install --no-deps -e .
+.venv-host\Scripts\python.exe -m personal_mcp gui
 ```
 
-The full gate matrix is in [docs/ci-and-tests.md](docs/ci-and-tests.md).
+启动浏览器和隧道前，按[构建说明](docs/personal/构建说明.md)准备 resources 中的固定版本资源。已有完整运行包时直接打开 UnifiedPersonalMCP.exe。
 
-## License
+在配置窗口填写工作区父目录、私有目录、设备名称、隧道 ID 与运行密钥引用。密钥只保存在本机私有目录或指定环境变量中。另一台设备使用同一份程序，重新填写自己的配置。
 
-This project is licensed under the [Apache License 2.0](LICENSE).
+完整[使用说明](docs/personal/使用说明.md)、[验证状态](verification.md)、[集成来源](third_party/README.md)。
 
-If you use code, documentation, substantial implementation details, or
-derivative work from this project, preserve the copyright notice, license
-notice, and [NOTICE](NOTICE) file, and clearly attribute the original project.
+## 客户端使用
 
-Project: Coding Tools MCP  
-Author: Coding Tools MCP Contributors  
-Source: https://github.com/xyTom/coding-tools-mcp
+1. UnifiedTask begin 指定工作区中的具体项目，保存仅返回一次的 workflow_id。
+2. UnifiedTask activate，然后在编码、桌面和浏览器工具中使用同一个 workflow_id。
+3. 每个写入操作使用唯一 request_id。结果为 unknown 时先观察，不自动重做。
+4. UnifiedTask end 释放资源。
 
-Citation metadata is available in [CITATION.cff](CITATION.cff).
+应用配置可随项目保存在 .bf/apps/*.json，并使用相对路径。示例在 [examples/personal](examples/personal)。桌面应用由 LaunchApplication 启动；App 用于切换和调整已有窗口。
+
+## 边界
+
+这是面向本人开发机的工具集合。可信模式中的命令具有当前 Windows 用户的权限，项目检查不是操作系统沙箱。不要接入不受信任的调用者或工作区。
+
+不包含 Desktop Commander 的托管云配对、遥测服务、Cloudflare 通道或个人浏览器配置。各上游文件保留原许可证；第三方依赖适用自己的许可证。仓库中没有本机运行配置、密钥、状态数据库或截图。

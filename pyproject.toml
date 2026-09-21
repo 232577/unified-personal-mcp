@@ -3,51 +3,38 @@ requires = ["setuptools>=68,<77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "coding-tools-mcp"
-version = "0.3.0"
-description = "Workspace-confined coding tools exposed as an MCP server."
-requires-python = ">=3.11"
+name = "unified-personal-mcp"
+version = "0.1.0"
+description = "One configurable Windows host for coding, desktop and browser tools over an OpenAI Secure MCP Tunnel."
+requires-python = ">=3.13,<3.14"
 dependencies = [
-  "PyJWT>=2.8",
+  "PyJWT==2.14.0", "Windows-MCP==0.8.5", "FastMCP==4.0.3", "mcp==2.2.0",
+  "psutil==7.2.2", "PyYAML==6.0.3", "jsonschema==4.26.0", "playwright==1.63.0",
+  "windows-capture==2.0.1", "opencv-python==5.0.0.93", "pywin32==312",
 ]
 readme = "README.md"
 license = { file = "LICENSE" }
-authors = [{ name = "Coding Tools MCP Contributors" }]
+authors = [{ name = "Unified Personal MCP Contributors" }]
 classifiers = [
   "License :: OSI Approved :: Apache Software License",
+  "Operating System :: Microsoft :: Windows",
 ]
 
 [project.urls]
-Homepage = "https://github.com/xyTom/coding-tools-mcp"
-Documentation = "https://github.com/xyTom/coding-tools-mcp/tree/main/docs"
-Source = "https://github.com/xyTom/coding-tools-mcp"
-Issues = "https://github.com/xyTom/coding-tools-mcp/issues"
+Homepage = "https://github.com/232577/unified-personal-mcp"
+Source = "https://github.com/232577/unified-personal-mcp"
+Issues = "https://github.com/232577/unified-personal-mcp/issues"
 
 [project.optional-dependencies]
-dev = [
-  # The official MCP SDK is the only client in the test suite we did not
-  # write; the dual-era smoke needs it installed to run at all.
-  "mcp>=2.0",
-  "mypy>=2.1,<2.2",
-  "PyYAML>=6.0",
-  "ruff>=0.15,<0.16",
-  "typing_extensions>=4.12",
-]
-desktop = [
-  "PySide6>=6.8,<6.9",
-  "psutil>=7.0,<8",
-]
-image = [
-  "Pillow>=10.0",
-]
+dev = ["pytest==9.1.1", "ruff==0.15.22", "mypy>=2.1,<2.2", "typing_extensions>=4.12"]
+fixture = ["pywebview==6.0", "pythonnet==3.1.0", "pyinstaller==6.22.0"]
+desktop = ["PySide6>=6.8,<6.9"]
+image = ["Pillow>=10.0"]
 
 [project.scripts]
+unified-personal-mcp = "personal_mcp.__main__:main"
 coding-tools-mcp = "coding_tools_mcp.server:main"
-coding-tools-mcp-desktop = "mcp_desktop_client.app:main"
 
 [tool.setuptools.packages.find]
-where = [".", "apps/desktop-client"]
-include = ["coding_tools_mcp*", "mcp_desktop_client*"]
-
-[tool.setuptools.package-data]
-mcp_desktop_client = ["locales/*.qm", "locales/*.ts"]
+where = ["."]
+include = ["personal_mcp*", "bf_automation*", "coding_tools_mcp*"]
