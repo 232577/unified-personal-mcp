@@ -283,7 +283,8 @@ class NativeWinApi:
                 native_text = ""
                 if native_hwnd and not self._safe(control, "IsPassword", False):
                     try:
-                        if class_name.casefold() == "edit":
+                        if (class_name.casefold() == "edit"
+                                or class_name.casefold().startswith(("richedit", "windowsforms10.edit"))):
                             style = self.win32gui.GetWindowLong(native_hwnd, self.win32con.GWL_STYLE)
                             if not (style & 0x20):
                                 native_text = self._read_native_text(native_hwnd, 32769)
