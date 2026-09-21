@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v6.0.2
       - uses: actions/setup-python@v6.2.0
         with:
-          python-version: "3.13"
+          python-version: "3.13.14"
       - name: Install pinned dependencies
         run: |
           python -m pip install -r requirements-windows.lock

@@ -56,9 +56,13 @@ def test_two_real_workers_are_private_deduplicated_and_cleanup_on_task_end(tmp_p
             assert m.request(b, sb, 'navigate', 'nav-b', {'page_id': pb, 'url': site.origin + '/app?label=B'})['state'] == 'completed'
             with pytest.raises(PermissionError):
                 m.read(b, sa, 'snapshot', {'page_id': pa})
-            pid_a = created[0]['result']['session']['worker_pid']
+            worker_a = m.sessions[sa].worker
             store.end(a)
-            assert not psutil.pid_exists(pid_a)
+            # Windows may retain or reuse the numeric PID after exit. Wait on
+            # this exact process handle and verify its whole owned Job drained.
+            assert worker_a.process.wait(timeout=5) is not None
+            assert worker_a.job is None and worker_a.active_pids() == []
+            assert sa not in m.sessions
             assert m.read(b, sb, 'snapshot', {'page_id': pb})['title'] == 'BF Browser B'
             assert m.operation_status(b, 'nav-a') is None
             store.end(b)
