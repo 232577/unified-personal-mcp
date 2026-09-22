@@ -32,6 +32,8 @@ python -m venv .venv-host
 
 完整[使用说明](docs/personal/使用说明.md)、[验证状态](verification.md)、[集成来源](third_party/README.md)。
 
+需要登录 Windows 后自动启动并连接隧道时，可运行 [自动启动安装脚本](scripts/install-autostart.ps1)，指定本设备的运行包目录和配置文件。它不会中断当前服务；具体步骤见使用说明。
+
 ## 客户端使用
 
 1. UnifiedTask begin 指定工作区中的具体项目，保存仅返回一次的 workflow_id。
