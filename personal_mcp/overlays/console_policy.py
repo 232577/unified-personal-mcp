@@ -1,4 +1,4 @@
-"""Windows console policy scoped to coding-tools-mcp, never global subprocess.
+"""Windows console policy scoped to backend modules, never global subprocess.
 
 Shell policy, argument parsing, pipes and exit codes retain upstream semantics.
 Windows cancellation and synchronous timeouts clean the owned process tree.
@@ -139,3 +139,18 @@ def install_console_policy() -> None:
             module.subprocess = QuietSubprocess(module.subprocess)
     processes.terminate_process_group = terminate_owned_tree
     server.terminate_process_group = terminate_owned_tree
+
+
+def install_bf_console_policy() -> None:
+    """Hide BF's internal PowerShell helpers, including timeout cleanup.
+
+    Windows-MCP uses this helper for desktop discovery and notifications even
+    when its public PowerShell tool is disabled. Keep application launchers and
+    their GUI windows separate from this background-only path.
+    """
+    if os.name != "nt":
+        return
+    from windows_mcp.powershell import utils
+
+    if not isinstance(utils.subprocess, QuietSubprocess):
+        utils.subprocess = QuietSubprocess(utils.subprocess)

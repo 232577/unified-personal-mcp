@@ -34,6 +34,8 @@ python -m venv .venv-host
 
 需要登录 Windows 后自动启动并连接隧道时，可运行 [自动启动安装脚本](scripts/install-autostart.ps1)，指定本设备的运行包目录和配置文件。它不会中断当前服务；具体步骤见使用说明。
 
+0.1.3 补齐桌面工具内部 PowerShell 和超时清理的隐藏启动。编码命令、桌面辅助脚本在后台执行并返回结果，不弹出控制台窗口；通过 LaunchApplication 启动的业务软件界面仍正常显示。调用方显式要求其他程序另开窗口的脚本不属于此默认隐藏策略。
+
 ## 客户端使用
 
 1. UnifiedTask begin 指定工作区中的具体项目，保存仅返回一次的 workflow_id。

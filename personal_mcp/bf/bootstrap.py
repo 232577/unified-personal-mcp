@@ -38,7 +38,9 @@ def build_mcp(*, state_root, allowed_root, apps_dir=None, controller_factory=Non
     from bf_automation.runtime import safe_upstream_tools
     from bf_automation.task_store import TaskStore
     from bf_automation.tool_contracts import apply_tool_contracts
+    from personal_mcp.overlays.console_policy import install_bf_console_policy
 
+    install_bf_console_policy()
     state, allowed = Path(state_root).resolve(), Path(allowed_root).resolve()
     apps = Path(apps_dir).resolve() if apps_dir else state / "apps"
     apps.mkdir(parents=True, exist_ok=True)
