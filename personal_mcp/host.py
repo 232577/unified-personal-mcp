@@ -11,7 +11,7 @@ from coding_tools_mcp.server import Runtime, TOOL_REGISTRY
 
 from . import __version__
 from .bf.executor import BFExecutor
-from .catalog import unified_catalog
+from .catalog import catalog_revision, unified_catalog
 from .coding import LocalTelemetry, build_coding
 from .full_control import FullControlProjectContext
 from .operations import OperationJournal
@@ -108,6 +108,10 @@ class UnifiedRuntime(Runtime):
         self.telemetry = LocalTelemetry()
         self.catalog = unified_catalog(bf_server, full_control=config.full_control,
                                        search_sessions=config.search_sessions)
+        self.catalog_revision = catalog_revision(self.catalog)
+        self.health_provider = None
+        self._usage_cache = {'commands': 0, 'retained_commands': 0, 'browser_sessions': 0,
+                             'webview2_instances': 0, 'search_sessions': 0}
         self.validators = {k: Draft202012Validator(v["inputSchema"]) for k, v in self.catalog.items()}
         self._exposed_tool_names = list(self.catalog)
         self._exposed_tool_name_set = frozenset(self.catalog)
@@ -130,9 +134,86 @@ class UnifiedRuntime(Runtime):
     def list_tools(self):
         return {"tools": deepcopy(list(self.catalog.values()))}
 
+    def health_snapshot(self):
+        health = self.health_provider() if self.health_provider else {
+            'status': 'healthy', 'tunnel': {'status': 'disabled', 'last_success': None,
+                'error_code': None, 'recovery_attempts': 0, 'next_retry': None}}
+        health = deepcopy(health)
+        health['bf'] = self.bf.snapshot()
+        states = {health['tunnel']['status'], health['bf']['status']}
+        if states & {'degraded', 'stopped'}:
+            health['status'] = 'degraded'
+        elif 'recovering' in states:
+            health['status'] = 'recovering'
+        return health
+
+    def resource_usage(self):
+        metadata = self.registry.snapshot(self.principal)
+        counters = dict(self._usage_cache)
+        stale = bool(metadata.get('stale'))
+        resources = None
+        if self.registry.lock.acquire(blocking=False):
+            try:
+                resources = [resource for key, resource in self.registry.resources.items()
+                             if self.registry._metadata[key]['owner'] == self.principal.key]
+            finally:
+                self.registry.lock.release()
+        if resources is None:
+            stale = True
+        else:
+            commands = retained = 0
+            complete = True
+            for resource in resources:
+                coding = resource.coding
+                if not coding.commands_lock.acquire(blocking=False):
+                    complete = False
+                    break
+                try:
+                    commands += sum(command.process.poll() is None for command in coding.commands.values())
+                    retained += len(coding.output_commands)
+                finally:
+                    coding.commands_lock.release()
+            if complete:
+                counters.update(commands=commands, retained_commands=retained)
+            else:
+                stale = True
+            keys = {resource.key for resource in resources}
+            task_keys = {self.bf_server._bf_store._task_key(resource.bf_token)
+                         for resource in resources if resource.bf_token}
+            browser = getattr(self.bf_server, '_bf_browser_manager', None)
+            hybrid = getattr(self.bf_server, '_bf_hybrid_manager', None)
+            for label, manager, lock_name, collection, owners in (
+                ('browser_sessions', browser, 'lock', 'sessions', task_keys),
+                ('webview2_instances', hybrid, '_lock', 'instances', task_keys),
+                ('search_sessions', self.searches, 'lock', 'sessions', keys),
+            ):
+                if manager is None:
+                    counters[label] = 0
+                    continue
+                lock = getattr(manager, lock_name)
+                if not lock.acquire(blocking=False):
+                    stale = True
+                    continue
+                try:
+                    counters[label] = sum(item.owner in owners for item in getattr(manager, collection).values())
+                finally:
+                    lock.release()
+        self._usage_cache = counters
+        return {**metadata, **counters, 'stale': stale,
+                'operation_results': self.operations.result_policy()}
+
     def call_tool(self, name, arguments, *, context=None):
         if name not in self.catalog:
             raise JsonRpcError(-32602, "Unknown tool")
+        journaled = False
+
+        def recovery_guidance():
+            if journaled:
+                return 'Query OperationStatus with the original request_id; do not replay.'
+            if name.startswith('Browser') and arguments.get('request_id'):
+                return 'Read server_info health and query BrowserActionStatus for the original browser action.'
+            return 'Read server_info health, then obtain a fresh observation; do not infer that a prior write failed.'
+
         try:
             self.validators[name].validate(arguments)
             args = dict(arguments)
@@ -147,6 +228,8 @@ class UnifiedRuntime(Runtime):
                     "device_label": self.config.device_label, "permission_mode": self.config.permission_mode,
                     "filesystem_scope": "current_windows_user" if self.config.full_control else "workflow_project",
                     "absolute_paths_allowed": self.config.full_control,
+                    "health": self.health_snapshot(), "catalog_revision": self.catalog_revision,
+                    "resource_usage": self.resource_usage(),
                     "concurrency": {"project_limit": None, "commands_per_workflow": 16,
                         "browser_sessions": browser.max_sessions if browser else 0,
                         "webview2_instances": hybrid.max_managed if hybrid else 0,
@@ -163,15 +246,39 @@ class UnifiedRuntime(Runtime):
                     result = self.registry.list(self.principal)
                 elif action == "release_idle":
                     result = self.registry.release_idle(self.principal, args["workflow_ref"])
+                elif action == 'resume':
+                    result = self.registry.resume(self.principal, args['workflow_ref'],
+                                                  args['request_id'], args['expected_generation'])
                 else:
                     result = getattr(self.registry, action)(self.principal, args["workflow_id"])
+                    if action == 'status' and result.get('state') == 'ACTIVE':
+                        with self.registry.use(self.principal, args['workflow_id'], control=True, touch=False) as resource:
+                            result['commands'] = resource.coding.command_inventory()
                 return tool_result(result)
             token = args.pop("workflow_id")
             write = name != "SearchSession" and not self.catalog[name]["annotations"].get("readOnlyHint", False)
-            with self.registry.use(self.principal, token, write=write) as resource:
+            control = (name in {'OperationStatus', 'kill_command', 'read_output'}
+                       or (name == 'write_stdin' and not args.get('chars', '')))
+            with self.registry.use(self.principal, token, write=write, control=control) as resource:
+                if write and not control:
+                    # The client wait may have ended while native work remains.
+                    # Check only after obtaining the workflow's write gate and
+                    # before journaling or dispatching any additional mutation.
+                    try:
+                        self.bf.drain(resource.bf_token, timeout=0)
+                    except TimeoutError:
+                        raise WorkflowError('WORKFLOW_WRITE_PENDING', {'next_action':
+                            'Observe the original operation and server_info health. For journaled writes, '
+                            'query OperationStatus with the original request_id; for browser actions, '
+                            'use BrowserActionStatus. Wait for the pending operation or native cleanup '
+                            'to finish before submitting another write. '
+                            'Status, command output polling and command cancellation remain available.'}) from None
+                if name == 'OperationStatus':
+                    return tool_result(self.operations.status(resource.key, args['request_id']))
                 if name in TOOL_REGISTRY:
                     if write:
                         request_id = args.pop("request_id")
+                        journaled = True
                         return self.operations.run(resource.key, request_id, name, args,
                             lambda: resource.coding.call_tool(name, args, context=context))
                     return resource.coding.call_tool(name, args, context=context)
@@ -190,17 +297,29 @@ class UnifiedRuntime(Runtime):
                     return tool_result({"ok": True, **result})
                 if write and not name.startswith("Browser"):
                     request_id = args.pop("request_id")
+                    journaled = True
                     return self.operations.run(resource.key, request_id, name, args,
-                        lambda: self.bf.call(name, {"bf_task_id": resource.bf_token, **args}))
+                        lambda: self.bf.submit(name, {"bf_task_id": resource.bf_token, **args}))
                 return self.bf.call(name, {"bf_task_id": resource.bf_token, **args})
         except WorkflowError as exc:
             return tool_result({"ok": False, "error": {"code": exc.code, "details": exc.details}})
         except ValidationError:
             return tool_result({"ok": False, "error": {"code": "INVALID_ARGUMENT"}})
-        except (ValueError, PermissionError, FileNotFoundError):
-            return tool_result({"ok": False, "error": {"code": "REQUEST_REFUSED"}})
-        except TimeoutError:
-            return tool_result({"ok": False, "error": {"code": "OUTCOME_UNKNOWN"}})
+        except (ValueError, PermissionError, FileNotFoundError) as exc:
+            code = str(exc)
+            allowed = {'REQUEST_CONFLICT', 'OPERATION_NOT_FOUND', 'RESULT_EXPIRED', 'OPERATION_CAPACITY'}
+            return tool_result({"ok": False, "error": {"code": code if code in allowed else "REQUEST_REFUSED"}})
+        except TimeoutError as exc:
+            code = 'OPERATION_RUNNING' if str(exc) == 'OPERATION_RUNNING' else 'OUTCOME_UNKNOWN'
+            return tool_result({"ok": False, "error": {"code": code,
+                'next_action': recovery_guidance()}})
+        except RuntimeError as exc:
+            code = str(exc)
+            allowed = {'BF_EXECUTOR_CLOSED', 'BF_RECOVERING', 'BF_CONNECTION_UNAVAILABLE',
+                       'BF_CALL_OUTCOME_UNKNOWN', 'BF_OPERATIONS_STILL_RUNNING'}
+            return tool_result({'ok': False, 'error': {
+                'code': code if code in allowed else 'EXECUTION_ERROR',
+                'next_action': recovery_guidance()}})
         except Exception:
             return tool_result({"ok": False, "error": {"code": "EXECUTION_ERROR", "outcome": "unknown"}})
 

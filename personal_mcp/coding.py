@@ -71,6 +71,16 @@ class CodingRuntime(Runtime):
         self.owned_job.close()
         super().close()
 
+    def command_inventory(self):
+        """Owner-scoped handles; command strings and environment are deliberately omitted."""
+        with self.commands_lock:
+            commands = {**self.output_commands, **self.commands}
+        return [{'command_id': key, 'pid': command.process.pid,
+                 'status': 'running' if command.process.poll() is None else 'exited',
+                 'started_at': command.started_at, 'completed_at': command.completed_at,
+                 'stdout_ref': f'command:{key}:stdout', 'stderr_ref': f'command:{key}:stderr'}
+                for key, command in commands.items()]
+
     def _command_env(self, extra):
         env = super()._command_env(extra)
         if self.full_control:

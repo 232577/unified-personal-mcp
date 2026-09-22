@@ -46,7 +46,7 @@ class Client:
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.output, self.sequence = output, 0
         self.tools = {t["name"]: t for t in self.rpc("tools/list", {})["tools"]}
-        assert len(self.tools) == 49
+        assert len(self.tools) == 50
 
     def rpc(self, method, params):
         self.sequence += 1
@@ -411,4 +411,3 @@ if __name__ == "__main__":
     parser.add_argument("--fixture", type=Path, default=ROOT / "verification/fixture-bin/UPM-WebView2-Fixture.exe")
     args = parser.parse_args()
     run(args.output, args.fixture.resolve(strict=True))
-

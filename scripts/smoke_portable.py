@@ -37,25 +37,43 @@ try:
     service.start()
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-    def call(name, **arguments):
+    def raw_call(name, **arguments):
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                            "params": {"name": name, "arguments": arguments}}).encode()
         request = urllib.request.Request(f"http://127.0.0.1:{number}/mcp", body,
             {"Authorization": "Bearer " + service.runtime.auth_token, "Content-Type": "application/json"})
         with opener.open(request, timeout=40) as response:
             result = json.load(response)["result"]
+        return result
+
+    def call(name, **arguments):
+        result = raw_call(name, **arguments)
         assert not result.get("isError"), result
         return result["structuredContent"]
 
     token = call("UnifiedTask", action="begin", project_path="smoke", request_id="begin")["workflow_id"]
     call("UnifiedTask", action="activate", workflow_id=token)
     code = "from pathlib import Path;p=Path('counter.txt');p.write_text(str(int(p.read_text())+1) if p.exists() else '1')"
-    command = '"' + str(sys.executable) + '" -c "' + code + '"'
+    command = '"' + str(sys.executable) + '" -B -c "' + code + '"'
     params = {"workflow_id": token, "request_id": "build-once", "cmd": command, "workdir": ".",
               "yield_time_ms": 1000, "timeout_ms": 10000}
     first = call("exec_command", **params)
     assert call("exec_command", **params) == first
     assert first["exit_code"] == 0 and (project / "counter.txt").read_text() == "1"
+    status = call('OperationStatus', workflow_id=token, request_id='build-once')
+    assert status['state'] == 'completed' and status['result']['structuredContent'] == first
+    listed = call('UnifiedTask', action='list')['workflows'][0]
+    resume = {'action': 'resume', 'workflow_ref': listed['workflow_ref'],
+              'request_id': 'resume-once', 'expected_generation': listed['credential_generation']}
+    recovered = call('UnifiedTask', **resume)
+    assert call('UnifiedTask', **resume) == recovered
+    denied = raw_call('UnifiedTask', action='status', workflow_id=token)
+    assert denied['structuredContent']['error']['code'] == 'WORKFLOW_CREDENTIAL_REPLACED'
+    token = recovered['workflow_id']
+    assert call('OperationStatus', workflow_id=token, request_id='build-once')['result']['structuredContent'] == first
+    info = call('server_info')
+    assert info['version'] == '0.1.6' and len(info['catalog_revision']) == 64
+    assert info['health']['bf']['status'] == 'healthy'
     (project / "note.txt").write_text("unified 中文 search", encoding="utf-8")
     search = call("SearchSession", workflow_id=token, action="start", pattern="unified")
     deadline = time.monotonic() + 5
@@ -111,9 +129,10 @@ try:
     assert call("UnifiedTask", workflow_id=token, action="end")["state"] == "ENDED"
     assert not service.runtime.searches.sessions
     assert not service.runtime.bf_server._bf_browser_manager.sessions
-    report.update(status="PASS", tools=service.status()["tools"], command_exactly_once=True, search=True, browser=True)
+    report.update(status="PASS", version=info['version'], tools=service.status()["tools"],
+                  command_exactly_once=True, search=True, browser=True, credential_resume=True,
+                  operation_status=True, catalog_revision=info['catalog_revision'])
 finally:
     service.stop()
     (output / "result.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 print(json.dumps(report))
-

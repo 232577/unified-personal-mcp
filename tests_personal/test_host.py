@@ -45,7 +45,7 @@ def workflow(host, access="write"):
 
 def test_exact_catalog_and_no_global_registry_change(host):
     tools = host.list_tools()["tools"]
-    assert len(tools) == 49 and len(TOOL_REGISTRY) == 18
+    assert len(tools) == 50 and len(TOOL_REGISTRY) == 18
     assert "task_context" not in {t["name"] for t in tools}
     for tool in tools:
         assert tool["outputSchema"]
@@ -109,7 +109,7 @@ def test_http_authentication_happens_before_dispatch(host):
         headers["Authorization"] = "Bearer " + host.auth_token
         with urllib.request.urlopen(urllib.request.Request(url, request_body, headers)) as response:
             result = json.load(response)
-        assert len(result["result"]["tools"]) == 49
+        assert len(result["result"]["tools"]) == 50
     finally:
         server.shutdown()
         server.server_close()

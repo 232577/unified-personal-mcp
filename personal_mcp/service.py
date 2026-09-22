@@ -9,19 +9,42 @@ import threading
 import time
 from pathlib import Path
 
+from coding_tools_mcp.protocol import jsonrpc_error, response_id
 from coding_tools_mcp.server import MCPHandler
+from . import __version__
 from .bf.bootstrap import build_mcp
 from .host import UnifiedRuntime
 from .protection import InstanceLock, prepare_private_directory
-from .tunnel import TunnelRunner
+from .tunnel_supervisor import TunnelSupervisor
+
+
+class PersonalMCPHandler(MCPHandler):
+    def handle_rpc(self, request, *, transport_protocol_version=None):
+        if request.get('method') != 'unified/tunnel/retry' or 'id' not in request:
+            return super().handle_rpc(request, transport_protocol_version=transport_protocol_version)
+        request_id = response_id(request)
+        # do_POST has already applied backend authentication and the complete
+        # transport/envelope checks. This capability is never sent to the tunnel.
+        credentials = self.headers.get_all('X-Unified-Control-Key') or []
+        if (len(credentials) != 1 or not secrets.compare_digest(
+                credentials[0].encode('utf-8'), self.server.control_key.encode('utf-8'))):
+            return jsonrpc_error(request_id, -32001, 'LOCAL_CONTROL_DENIED')
+        if request.get('params') != {}:
+            return jsonrpc_error(request_id, -32602, 'LOCAL_CONTROL_PARAMS_MUST_BE_EMPTY_OBJECT')
+        try:
+            snapshot = self.server.tunnel_retry()
+        except Exception:
+            return jsonrpc_error(request_id, -32000, 'LOCAL_SERVICE_NOT_RUNNING')
+        return {'jsonrpc': '2.0', 'id': request_id, 'result': {'ok': True, 'tunnel': snapshot}}
 
 
 class ServiceHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, runtime):
+    def __init__(self, address, runtime, *, control_key, tunnel_retry):
         self.runtime = runtime
-        super().__init__(address, MCPHandler)
+        self.control_key, self.tunnel_retry = control_key, tunnel_retry
+        super().__init__(address, PersonalMCPHandler)
 
 
 class LocalService:
@@ -32,6 +55,7 @@ class LocalService:
         self.http_thread = self.maintenance_thread = None
         self.stopping = threading.Event()
         self.failure = None
+        self._tunnel_lock = threading.Lock()
 
     def start(self, *, connect_tunnel=False):
         if self.guard is not None:
@@ -49,6 +73,16 @@ class LocalService:
             key = key_path.read_text(encoding="utf-8").strip()
             if len(key) < 32 or any(c.isspace() for c in key):
                 raise ValueError("BACKEND_KEY_INVALID")
+            control_path = self.config.data_root / 'control.key'
+            if not control_path.exists():
+                control_path.write_text(secrets.token_urlsafe(48), encoding='utf-8')
+            if control_path.stat().st_size > 1024:
+                raise ValueError('CONTROL_KEY_INVALID')
+            control_key = control_path.read_text(encoding='utf-8').strip()
+            if (len(control_key) < 32 or not control_key.isascii()
+                    or any(c.isspace() or ord(c) < 32 for c in control_key)
+                    or secrets.compare_digest(control_key, key)):
+                raise ValueError('CONTROL_KEY_INVALID')
             python = self.assets / "python" / "python.exe"
             if not python.is_file():
                 python = Path(sys.executable)
@@ -64,7 +98,9 @@ class LocalService:
             rg = self.assets / "bin" / "rg.exe"
             self.runtime = UnifiedRuntime(self.config, auth_token=key, bf_server=bf,
                                           rg_path=rg if rg.is_file() else None)
-            self.server = ServiceHTTPServer((self.config.host, self.config.port), self.runtime)
+            self.runtime.health_provider = self.health_snapshot
+            self.server = ServiceHTTPServer((self.config.host, self.config.port), self.runtime,
+                control_key=control_key, tunnel_retry=self.connect_tunnel)
             self.http_thread = threading.Thread(target=self.server.serve_forever, daemon=True, name="personal-http")
             self.http_thread.start()
             if connect_tunnel:
@@ -78,25 +114,31 @@ class LocalService:
             raise
 
     def connect_tunnel(self):
-        if self.runtime is None or self.server is None:
-            raise RuntimeError("LOCAL_SERVICE_NOT_RUNNING")
-        if self.tunnel is not None:
-            raise RuntimeError("TUNNEL_ALREADY_STARTED")
-        runner = TunnelRunner(self.config, self.assets / "tunnel-client" / "tunnel-client.exe", self.runtime.auth_token)
-        self.tunnel = runner
-        try:
-            return runner.start()
-        except BaseException:
-            runner.close()
-            self.tunnel = None
-            raise
+        with self._tunnel_lock:
+            if self.stopping.is_set() or self.runtime is None or self.server is None:
+                raise RuntimeError("LOCAL_SERVICE_NOT_RUNNING")
+            if self.tunnel is None:
+                self.tunnel = TunnelSupervisor(self.config,
+                    self.assets / "tunnel-client" / "tunnel-client.exe", self.runtime.auth_token)
+                return self.tunnel.start()
+            return self.tunnel.retry()
+
+    def health_snapshot(self):
+        tunnel = self.tunnel
+        component = tunnel.snapshot() if tunnel else {
+            'status': 'disabled', 'last_success': None, 'error_code': None,
+            'recovery_attempts': 0, 'next_retry': None}
+        running = bool(self.server and self.http_thread and self.http_thread.is_alive())
+        status = component['status'] if component['status'] != 'disabled' else 'healthy'
+        return {'status': status if running else 'stopped', 'tunnel': component}
 
     def status(self):
-        tunnel = self.tunnel
+        health = self.health_snapshot()
         return {"running": bool(self.server and self.http_thread and self.http_thread.is_alive()),
                 "device_label": self.config.device_label, "port": self.config.port,
                 "tools": len(self.runtime.catalog) if self.runtime else 0,
-                "tunnel_connected": bool(tunnel and tunnel.ready()),
+                "tunnel_connected": health['tunnel']['status'] == 'healthy',
+                "version": __version__, "health": health,
                 "recovery": self.runtime.recovery_status if self.runtime else None,
                 "error": self.failure}
 
@@ -122,19 +164,22 @@ class LocalService:
                     pass
 
     def stop(self):
-        self.stopping.set()
+        with self._tunnel_lock:
+            self.stopping.set()
+            tunnel = self.tunnel
+        # Disable reconnect before any possibly slow workflow maintenance cleanup.
+        errors = []
+        if tunnel is not None:
+            try:
+                tunnel.close()
+                self.tunnel = None
+            except Exception as exc:
+                errors.append(exc)
         if self.maintenance_thread is not None:
             self.maintenance_thread.join(timeout=3)
             if self.maintenance_thread.is_alive():
                 raise RuntimeError("MAINTENANCE_SHUTDOWN_INCOMPLETE")
             self.maintenance_thread = None
-        errors = []
-        if self.tunnel is not None:
-            try:
-                self.tunnel.close()
-                self.tunnel = None
-            except Exception as exc:
-                errors.append(exc)
         if self.server is not None:
             if self.http_thread and self.http_thread.is_alive():
                 self.server.shutdown()

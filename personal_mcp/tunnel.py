@@ -3,7 +3,6 @@
 import hashlib
 import os
 import subprocess
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -86,7 +85,7 @@ class TunnelRunner:
         self.config, self.binary, self.backend_key = config, binary, backend_key
         self.job = self.lock = self.process = None
 
-    def start(self, timeout=30):
+    def start(self):
         if self.process is not None:
             raise RuntimeError("TUNNEL_ALREADY_STARTED")
         binary = verify_client(self.binary)
@@ -108,21 +107,16 @@ class TunnelRunner:
                 "--pid.file", str(self.config.data_root / "tunnel.pid")],
                 env=env, cwd=self.config.data_root, stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                if self.process.poll() is not None:
-                    raise RuntimeError("TUNNEL_START_FAILED")
-                if self.ready():
-                    return {"ready": True, "pid": self.process.pid}
-                time.sleep(0.1)
-            raise TimeoutError("TUNNEL_READY_TIMEOUT")
+            return {"started": True, "pid": self.process.pid}
         except BaseException:
             self.close()
             raise
 
+    def is_alive(self):
+        return self.process is not None and self.process.poll() is None
+
     def ready(self):
-        process = self.process
-        if process is None or process.poll() is not None:
+        if not self.is_alive():
             return False
         try:
             path = self.config.data_root / "tunnel-health.url"

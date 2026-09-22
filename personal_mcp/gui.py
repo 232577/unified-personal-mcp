@@ -1,12 +1,14 @@
 """A small Windows setup window; credentials are references, never displayed."""
 
-import json
 import queue
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, ttk
 
+from . import __version__
+from .autostart import AutostartManager, bundle_directory
 from .config import load_config
 from .service import LocalService
 from .settings import doctor, save_settings
@@ -22,7 +24,56 @@ ERRORS = {
     "TUNNEL_START_FAILED": "隧道启动失败，请检查私有数据目录中的隧道日志。",
     "SERVICE_CLEANUP_INCOMPLETE": "部分资源尚未关闭，项目仍保持锁定。请再次点击停止服务。",
     "BACKEND_KEY_INVALID": "本地连接密钥损坏，请检查私有数据目录。",
+    "PORTABLE_PACKAGE_REQUIRED": "请使用完整便携包中的程序来设置登录自启动。",
+    "PACKAGE_HASH_MISMATCH": "程序包校验失败，已保留原来的自启动设置。请重新解压完整程序包。",
+    "PACKAGE_INVALID": "程序包不完整，已保留原来的自启动设置。",
+    "PACKAGE_VERSION_MISMATCH": "程序包版本不一致，已保留原来的自启动设置。",
+    "ISOLATED_START_FAILED": "新程序的隔离启动检查未通过，已保留原来的自启动设置。",
+    "AUTOSTART_TASK_NOT_OWNED": "同名启动任务不属于当前用户的本程序，未修改它。",
+    "AUTOSTART_CONFIGURATION_CONFLICT": "已有启动任务使用另一份配置，未覆盖它。请使用原配置或为独立安装指定另一任务名。",
+    "AUTOSTART_UPDATE_FAILED": "更新自启动失败，已恢复原来的设置。",
+    "AUTOSTART_ROLLBACK_FAILED": "更新自启动及恢复旧设置均未完成，请检查私有数据目录中的自启动备份。",
+    "AUTOSTART_UPDATE_CONFLICT": "启动任务已被外部修改或无法确认更新结果，未覆盖当前设置。旧设置备份保存在私有数据目录中。",
+    "LOCAL_SERVICE_NOT_RUNNING": "未找到使用当前配置的运行服务，请刷新状态或启动本地服务。",
+    "LOCAL_RETRY_UNAVAILABLE": "当前后台版本尚不支持本机重试入口，请在新版启用后重试。当前服务保持运行。",
+    "LOCAL_CONTROL_KEY_INVALID": "本机控制凭证不可用，请检查私有数据目录。",
+    "LOCAL_RETRY_FAILED": "未能确认重试结果，请稍后刷新状态。当前服务保持运行。",
 }
+
+
+def service_presentation(observed, *, owned):
+    active = bool(observed.get("running"))
+    uncertain = bool(observed.get("running_unknown"))
+    tunnel = observed.get('health', {}).get('tunnel', {})
+    tunnel_state = tunnel.get('status')
+    version = observed.get("running_version") or "版本待确认"
+    text = "尚未启动"
+    if uncertain:
+        text = "暂时无法确认后台服务状态"
+    elif active:
+        connection = "OpenAI 已连接" if observed.get("tunnel_connected") else "本地服务运行中"
+        count = observed.get("tools")
+        text = f"{connection} · 当前运行 {version}" + (f" · {count} 个工具" if count else "")
+        if observed.get("service_error"):
+            text += " · 需要检查运行状态"
+        if tunnel.get('error_code'):
+            text += ' · ' + ERRORS.get(tunnel['error_code'], '连接暂不可用，可重新尝试连接')
+        if not owned and observed.get('retry_error'):
+            text += ' · 当前版本的重试入口不可用，需启用新版'
+        if not owned:
+            text += "（后台服务）"
+    pending = observed.get("pending_version")
+    startup = "登录自启动：" + ("已启用" if observed.get("enabled") else "未启用")
+    if observed.get('error') in ERRORS:
+        startup += ' · ' + ERRORS[observed['error']]
+    if pending:
+        startup += f" · 已配置版本 {pending}"
+        if observed.get("enabled") and pending != observed.get("running_version"):
+            startup += "（下次登录启用）"
+    return {"text": text, "startup_text": startup, "start": not active and not uncertain and not owned,
+            "connect": active and not uncertain and (owned or bool(observed.get('retry_available')))
+                and not observed.get('tunnel_connected') and tunnel_state not in {'healthy', 'recovering'},
+            "stop": owned, "editable": not active and not uncertain and not owned}
 
 
 class SetupWindow:
@@ -30,12 +81,16 @@ class SetupWindow:
         self.root, self.path, self.assets = root, Path(path).resolve(), assets_root
         self.service, self.busy, self.closing = None, False, False
         self.events = queue.Queue()
+        self.status_events = queue.Queue()
+        self.status_inflight, self.next_status_check = False, 0.0
+        self.status_factory = AutostartManager
+        self.observed = {"running_unknown": True}
         self.values = {name: tk.StringVar() for name in
             ("device_label", "workspace_root", "data_root", "tunnel_id", "key_source", "key", "port", "permission_mode",
              "workflow_idle_seconds", "browser_sessions", "webview2_instances", "search_sessions")}
         root.title("个人开发机连接 · Unified Personal MCP")
-        root.geometry("880x900")
-        root.minsize(850, 850)
+        root.geometry("920x980")
+        root.minsize(880, 900)
         root.configure(bg="#f5f6f8")
         style = ttk.Style(root)
         style.theme_use("vista")
@@ -94,8 +149,17 @@ class SetupWindow:
             button = ttk.Button(actions, text=title, command=callback)
             button.pack(side="left", padx=(0, 5))
             self.buttons[name] = button
+        startup = ttk.Frame(page)
+        startup.grid(row=14, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        for name, title, callback in (("enable_login", "启用登录自启动", self.enable_login),
+                                     ("disable_login", "取消登录自启动", self.disable_login)):
+            button = ttk.Button(startup, text=title, command=callback)
+            button.pack(side="left", padx=(0, 5))
+            self.buttons[name] = button
+        self.startup_label = ttk.Label(page, text="正在读取登录自启动状态…", wraplength=810)
+        self.startup_label.grid(row=15, column=0, columnspan=3, sticky="w", pady=(8, 0))
         feedback_frame = ttk.Frame(page)
-        feedback_frame.grid(row=14, column=0, columnspan=3, sticky="nsew", pady=(18, 10))
+        feedback_frame.grid(row=16, column=0, columnspan=3, sticky="nsew", pady=(12, 10))
         feedback_frame.rowconfigure(0, weight=1)
         feedback_frame.columnconfigure(0, weight=1)
         self.feedback = tk.Text(feedback_frame, height=5, wrap="word", font=("Microsoft YaHei UI", 10),
@@ -104,9 +168,9 @@ class SetupWindow:
         scrollbar = ttk.Scrollbar(feedback_frame, orient="vertical", command=self.feedback.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.feedback.configure(yscrollcommand=scrollbar.set)
-        page.rowconfigure(14, weight=1)
+        page.rowconfigure(16, weight=1)
         ttk.Label(page, text="配置文件：" + str(self.path), wraplength=730,
-                  foreground="#596579").grid(row=15, column=0, columnspan=3, sticky="w")
+                  foreground="#596579").grid(row=17, column=0, columnspan=3, sticky="w")
         self.load()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Control-s>", lambda event: self.save() if not self.busy else None)
@@ -188,8 +252,8 @@ class SetupWindow:
         threading.Thread(target=work, daemon=True, name="personal-setup").start()
 
     def save(self):
-        if self.service is not None:
-            self.show("请先停止服务，再修改配置。")
+        if self.service is not None or self.observed.get("running") or self.observed.get("running_unknown"):
+            self.show("配置正在被服务使用，暂不能覆盖。请在服务停止后修改。")
             return
         try:
             raw, key_import = self.raw()
@@ -217,13 +281,22 @@ class SetupWindow:
                 if self.service.guard is None:
                     self.service = None
                 raise
-            return "本地服务已启动，49 个工具可用。点击“连接 OpenAI”后可从客户端使用。"
+            count = self.service.status().get("tools", 0)
+            return f"本地服务已启动，{count} 个工具可用。点击“连接 OpenAI”后可从客户端使用。"
         self.submit(start, "正在启动本地服务…")
 
     def connect(self):
         def connect():
+            if self.service is None:
+                result = self.status_factory(self.path).retry_tunnel()
+                tunnel = result['tunnel']
+                self.status_events.put({**self.observed, 'health': {'tunnel': tunnel},
+                                        'tunnel_connected': tunnel.get('status') == 'healthy'})
+                return '连接重试已提交。请以上方实际连接状态为准。'
             self.service.connect_tunnel()
-            return "OpenAI 隧道已就绪。请在客户端验证连接和工具目录。"
+            if self.service.status().get("tunnel_connected"):
+                return "OpenAI 隧道已就绪。请在客户端验证连接和工具目录。"
+            return "已开始连接 OpenAI。请以上方实际连接状态为准；网络恢复后会自动尝试重新连接。"
         self.submit(connect, "正在连接 OpenAI…")
 
     def stop(self):
@@ -233,6 +306,40 @@ class SetupWindow:
                 self.service = None
             return "服务已停止，已释放本程序的任务资源。"
         self.submit(stop, "正在停止服务并清理任务资源…")
+
+    def enable_login(self):
+        def enable():
+            result = self.status_factory(self.path).enable(bundle_directory(self.assets), expected_version=__version__)
+            return (f"已验证并设置版本 {result['pending_version']}。下次登录 Windows 后自动连接，"
+                    "当前运行中的项目保持运行。")
+        self.submit(enable, "正在校验完整程序包并进行隔离启动检查；现有服务继续运行…")
+
+    def disable_login(self):
+        def disable():
+            self.status_factory(self.path).disable()
+            return "已取消下次登录时自动连接。当前后台服务和项目继续运行。"
+        self.submit(disable, "正在取消登录自启动…")
+
+    def refresh_status(self):
+        if self.status_inflight:
+            return
+        self.status_inflight = True
+        def refresh():
+            try:
+                result = self.status_factory(self.path).status()
+            except (ValueError, FileNotFoundError):
+                result = {"running": False, "enabled": False, "configuration_required": True}
+            except Exception:
+                result = {"running_unknown": True, "enabled": None, "error": "STATUS_UNAVAILABLE"}
+            service = getattr(self, "service", None)
+            if service is not None:
+                try:
+                    local = service.status()
+                    result.update(local, running_version=__version__, service_error=local.get("error"))
+                except Exception:
+                    result.update(running_unknown=True, error="STATUS_UNAVAILABLE")
+            self.status_events.put(result)
+        threading.Thread(target=refresh, daemon=True, name="personal-status").start()
 
     def close(self):
         if self.busy:
@@ -246,31 +353,36 @@ class SetupWindow:
             ok, message = self.events.get_nowait()
             self.busy = False
             self.show(message)
+            self.next_status_check = 0
             if ok and self.closing:
                 self.root.destroy()
                 return
             self.closing = False
         except queue.Empty:
             pass
-        active = self.service is not None
+        try:
+            self.observed = self.status_events.get_nowait()
+            self.status_inflight = False
+            self.next_status_check = time.monotonic() + 5
+        except queue.Empty:
+            pass
+        if not self.status_inflight and time.monotonic() >= self.next_status_check:
+            self.refresh_status()
+        owned = self.service is not None
+        observed = dict(self.observed)
+        if owned:
+            observed.update(running_version=__version__)
+        view = service_presentation(observed, owned=owned)
+        active = not view["editable"]
         for entry, normal in self.fields:
             entry.configure(state="disabled" if self.busy or active else normal)
-        enabled = {"save": not active, "doctor": True, "start": not active,
-                   "connect": active and self.service.tunnel is None, "stop": active}
+        enabled = {"save": not active, "doctor": True, "start": view["start"],
+                   "connect": view['connect'], "stop": owned,
+                   "enable_login": self.path.is_file(), "disable_login": bool(observed.get("enabled"))}
         for name, button in self.buttons.items():
             button.configure(state="normal" if not self.busy and enabled[name] else "disabled")
-        status = "操作进行中…" if self.busy else "尚未启动"
-        if active and not self.busy:
-            status = "本地服务运行中 · 49 个工具"
-            try:
-                saved = json.loads((self.service.config.data_root / "service-status.json").read_text())
-                if saved.get("tunnel_connected"):
-                    status = "OpenAI 已连接 · 49 个工具"
-                if saved.get("error") or self.service.failure:
-                    status = "需要处理 · 请检查私有数据目录中的运行状态"
-            except (ValueError, OSError):
-                status = "正在更新运行状态…"
-        self.state_label.configure(text=status)
+        self.state_label.configure(text="操作进行中… · " + view["text"] if self.busy else view["text"])
+        self.startup_label.configure(text=view["startup_text"])
         self.root.after(150, self.poll)
 
 

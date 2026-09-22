@@ -53,4 +53,4 @@ def test_discovery_reports_actual_resource_limits(host):
     assert capacity['browser_sessions'] == 4
     assert capacity['foreground_input'] == 1
     assert capacity['workflow_idle_seconds'] == host.config.workflow_idle_seconds
-    assert len(host.list_tools()['tools']) == 49
+    assert len(host.list_tools()['tools']) == 50

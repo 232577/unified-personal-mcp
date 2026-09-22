@@ -27,6 +27,21 @@ def run(*command, **kwargs):
     subprocess.run(list(map(str, command)), check=True, **kwargs)
 
 
+def installation_files(destination):
+    """Ship login management with the package rather than referencing the repo."""
+    import ast
+
+    module = ast.parse((ROOT / "personal_mcp/__init__.py").read_text(encoding="utf-8"))
+    version = next(ast.literal_eval(statement.value) for statement in module.body
+        if isinstance(statement, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "__version__"
+                                                   for target in statement.targets))
+    scripts = destination / "scripts"
+    scripts.mkdir(exist_ok=True)
+    shutil.copy2(ROOT / "scripts/install-autostart.ps1", scripts / "install-autostart.ps1")
+    (destination / "package-metadata.json").write_text(json.dumps(
+        {"name": "unified-personal-mcp", "version": version}, indent=2), encoding="utf-8")
+
+
 def build(destination, python_home, assets, *, zip_output=False):
     destination = destination.resolve()
     if not destination.is_relative_to(ROOT / "release-private") or destination.exists():
@@ -67,12 +82,13 @@ def build(destination, python_home, assets, *, zip_output=False):
     shutil.copytree(ROOT / "third_party", destination / "third_party")
     shutil.copytree(ROOT / "docs/personal", destination / "docs/personal")
     shutil.copytree(ROOT / "examples/personal", destination / "examples/personal")
+    installation_files(destination)
     csc = Path(os.environ.get("SystemRoot", "C:/Windows")) / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
     run(csc, "/nologo", "/target:winexe", "/platform:x64", "/reference:System.Windows.Forms.dll",
         "/out:" + str(destination / "UnifiedPersonalMCP.exe"), ROOT / "packaging/Launcher.cs")
     # Confirm the runtime, modules and worker entry point resolve from this installation.
-    run(target_python / "python.exe", "-s", app / "run.py", "--help", cwd=destination)
-    run(target_python / "python.exe", "-I", "-c",
+    run(target_python / "python.exe", "-B", "-s", app / "run.py", "--help", cwd=destination)
+    run(target_python / "python.exe", "-B", "-I", "-c",
         "import tkinter,win32api,playwright; from fastmcp import FastMCP; "
         "from windows_mcp.desktop.service import Desktop; print('portable imports OK')",
         cwd=destination)
@@ -92,4 +108,3 @@ if __name__ == "__main__":
     parser.add_argument("--zip", action="store_true")
     args = parser.parse_args()
     build(args.output, args.python_home, args.assets, zip_output=args.zip)
-

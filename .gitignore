@@ -38,6 +38,7 @@ docs/project-context.md
 docs/project-context/
 .venv-*/
 .local/
+.tmp/
 .private/
 .codex/
 .superpowers/

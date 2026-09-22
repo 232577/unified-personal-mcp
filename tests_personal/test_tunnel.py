@@ -52,3 +52,40 @@ def test_unpinned_client_cannot_run(tmp_path):
     binary.write_bytes(b"unexpected binary")
     with pytest.raises(ValueError, match="TUNNEL_CLIENT_HASH_MISMATCH"):
         verify_client(binary)
+
+
+def test_process_creation_returns_before_readiness_and_owns_cleanup(tmp_path, monkeypatch):
+    from personal_mcp import tunnel
+    cfg = load_config(installation(tmp_path))
+    cfg.data_root.mkdir(parents=True, exist_ok=True)
+    process = type('Process', (), {'pid': 123, 'poll': lambda self: None,
+                                  'wait': lambda self, timeout: None})()
+    jobs = []
+
+    class Job:
+        def __init__(self):
+            self.closed = False
+            jobs.append(self)
+
+        def spawn(self, args, **kwargs):
+            assert kwargs['stdin'] == tunnel.subprocess.DEVNULL
+            assert kwargs['stdout'] == tunnel.subprocess.DEVNULL
+            return process
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(tunnel, 'verify_client', lambda binary: binary)
+    monkeypatch.setattr(tunnel, 'assert_tunnel_available', lambda ident: None)
+    monkeypatch.setattr(tunnel, 'read_tunnel_key', lambda config: 'fixture-cloud-key')
+    monkeypatch.setattr(tunnel, 'OwnedJob', Job)
+    runner = tunnel.TunnelRunner(cfg, tmp_path / 'fixture.exe', 'fixture-backend-key')
+    monkeypatch.setattr(runner, 'ready', lambda: pytest.fail('start must not probe readiness'))
+    try:
+        result = runner.start()
+        assert result == {'started': True, 'pid': 123}
+        assert runner.is_alive()
+        assert not jobs[0].closed
+    finally:
+        runner.close()
+    assert jobs[0].closed
