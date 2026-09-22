@@ -55,7 +55,7 @@ class HybridManager:
         self.platform = platform or HybridPlatform()
         from .attach import ExistingWebViewResolver
         self.attach_resolver = attach_resolver or ExistingWebViewResolver(self.platform)
-        if type(max_managed) is not int or max_managed != 2:
+        if type(max_managed) is not int or not 1 <= max_managed <= 16:
             raise ValueError('UNVERIFIED_HYBRID_LIMIT')
         self.max_managed = max_managed
         self.instances = {}

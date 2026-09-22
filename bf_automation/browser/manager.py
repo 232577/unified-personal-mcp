@@ -50,7 +50,7 @@ class BrowserManager:
         max_sessions = self.config.get('max_sessions')
         max_pages = self.config.get('max_pages_per_session')
         if (self.config.get('version') != 1 or self.config.get('mode') != 'headless'
-                or type(max_sessions) is not int or not 1 <= max_sessions <= 4
+                or type(max_sessions) is not int or not 1 <= max_sessions <= 32
                 or type(max_pages) is not int or max_pages != 4):
             raise ValueError('UNVERIFIED_BROWSER_CONFIG')
         self.max_sessions = max_sessions

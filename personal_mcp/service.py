@@ -54,12 +54,13 @@ class LocalService:
                 python = Path(sys.executable)
             browser_config = self.config.data_root / "browser.local.json"
             browser_config.write_text(json.dumps({"enabled": True, "version": 1, "mode": "headless",
-                "max_sessions": 4, "max_pages_per_session": 4, "python": str(python),
+                "max_sessions": self.config.browser_sessions, "max_pages_per_session": 4, "python": str(python),
                 "browsers_path": str(self.assets / "browsers"),
                 "actions_enabled": True, "transfers_enabled": True}), encoding="utf-8")
             bf = build_mcp(state_root=self.config.data_root / "bf", allowed_root=self.config.workspace_root,
                            apps_dir=self.config.data_root / "apps", browser_config_path=browser_config,
-                           full_control=self.config.full_control)
+                           full_control=self.config.full_control,
+                           max_hybrid_instances=self.config.webview2_instances)
             rg = self.assets / "bin" / "rg.exe"
             self.runtime = UnifiedRuntime(self.config, auth_token=key, bf_server=bf,
                                           rg_path=rg if rg.is_file() else None)

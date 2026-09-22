@@ -31,10 +31,11 @@ class SetupWindow:
         self.service, self.busy, self.closing = None, False, False
         self.events = queue.Queue()
         self.values = {name: tk.StringVar() for name in
-            ("device_label", "workspace_root", "data_root", "tunnel_id", "key_source", "key", "port", "permission_mode")}
+            ("device_label", "workspace_root", "data_root", "tunnel_id", "key_source", "key", "port", "permission_mode",
+             "workflow_idle_seconds", "browser_sessions", "webview2_instances", "search_sessions")}
         root.title("个人开发机连接 · Unified Personal MCP")
-        root.geometry("850x830")
-        root.minsize(800, 750)
+        root.geometry("880x900")
+        root.minsize(850, 850)
         root.configure(bg="#f5f6f8")
         style = ttk.Style(root)
         style.theme_use("vista")
@@ -70,8 +71,23 @@ class SetupWindow:
                 self.fields.append((button, "normal"))
         ttk.Label(page, text="任务分别管理进程和浏览器。完全控制模式允许跨目录读写及调用外部工具，权限等同当前 Windows 用户。",
             wraplength=710, foreground="#596579").grid(row=11, column=0, columnspan=3, sticky="w", pady=(10, 12))
+        capacity = ttk.LabelFrame(page, text="并行与会话设置", padding=(12, 6))
+        capacity.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+        capacity.columnconfigure(1, weight=1)
+        capacity.columnconfigure(3, weight=1)
+        for index, (title, name, minimum, maximum) in enumerate((
+            ("浏览器会话", "browser_sessions", 1, 32),
+            ("WebView2 实例", "webview2_instances", 1, 16),
+            ("搜索会话", "search_sessions", 1, 64),
+            ("空闲释放（秒）", "workflow_idle_seconds", 300, 86400),
+        )):
+            row, column = divmod(index, 2)
+            ttk.Label(capacity, text=title).grid(row=row, column=column * 2, sticky="w", padx=(0, 10), pady=4)
+            field = ttk.Spinbox(capacity, textvariable=self.values[name], from_=minimum, to=maximum, width=10)
+            field.grid(row=row, column=column * 2 + 1, sticky="ew", padx=(0, 18 if column == 0 else 0), pady=4)
+            self.fields.append((field, "normal"))
         actions = ttk.Frame(page)
-        actions.grid(row=12, column=0, columnspan=3, sticky="ew")
+        actions.grid(row=13, column=0, columnspan=3, sticky="ew")
         for name, title, callback in (("save", "保存配置", self.save), ("doctor", "检查配置", self.check),
                                      ("start", "启动本地服务", self.start), ("connect", "连接 OpenAI", self.connect),
                                      ("stop", "停止服务", self.stop)):
@@ -79,18 +95,18 @@ class SetupWindow:
             button.pack(side="left", padx=(0, 5))
             self.buttons[name] = button
         feedback_frame = ttk.Frame(page)
-        feedback_frame.grid(row=13, column=0, columnspan=3, sticky="nsew", pady=(18, 10))
+        feedback_frame.grid(row=14, column=0, columnspan=3, sticky="nsew", pady=(18, 10))
         feedback_frame.rowconfigure(0, weight=1)
         feedback_frame.columnconfigure(0, weight=1)
-        self.feedback = tk.Text(feedback_frame, height=9, wrap="word", font=("Microsoft YaHei UI", 10),
+        self.feedback = tk.Text(feedback_frame, height=5, wrap="word", font=("Microsoft YaHei UI", 10),
             relief="solid", borderwidth=1, padx=12, pady=10, bg="white", fg="#263448", state="disabled")
         self.feedback.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(feedback_frame, orient="vertical", command=self.feedback.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.feedback.configure(yscrollcommand=scrollbar.set)
-        page.rowconfigure(13, weight=1)
+        page.rowconfigure(14, weight=1)
         ttk.Label(page, text="配置文件：" + str(self.path), wraplength=730,
-                  foreground="#596579").grid(row=14, column=0, columnspan=3, sticky="w")
+                  foreground="#596579").grid(row=15, column=0, columnspan=3, sticky="w")
         self.load()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Control-s>", lambda event: self.save() if not self.busy else None)
@@ -100,7 +116,9 @@ class SetupWindow:
         private = self.path.parent / "data"
         defaults = {"device_label": "我的开发机", "workspace_root": "", "data_root": str(private),
             "tunnel_id": "", "key_source": "密钥文件", "key": str(private / "tunnel.key"),
-            "port": "28776", "permission_mode": "允许项目内执行"}
+            "port": "28776", "permission_mode": "允许项目内执行",
+            "workflow_idle_seconds": "1800", "browser_sessions": "8",
+            "webview2_instances": "4", "search_sessions": "16"}
         if self.path.is_file():
             try:
                 cfg = load_config(self.path)
@@ -108,6 +126,8 @@ class SetupWindow:
                     data_root=str(cfg.data_root), tunnel_id=cfg.tunnel_id, port=str(cfg.port),
                     key_source="环境变量" if cfg.tunnel_key_env else "密钥文件",
                     key=cfg.tunnel_key_env or str(cfg.tunnel_key_file),
+                    workflow_idle_seconds=str(cfg.workflow_idle_seconds), browser_sessions=str(cfg.browser_sessions),
+                    webview2_instances=str(cfg.webview2_instances), search_sessions=str(cfg.search_sessions),
                     permission_mode={"trusted": "允许项目内执行", "safe": "限制执行",
                                      "full_control": "完全控制本机"}[cfg.permission_mode])
             except Exception:
@@ -141,6 +161,10 @@ class SetupWindow:
         return {"schema_version": 1, "workspace_root": values["workspace_root"],
                 "data_root": values["data_root"], "device_label": values["device_label"],
                 "port": int(values["port"]), "host": "127.0.0.1", "tunnel": tunnel,
+                "workflow_idle_seconds": int(values["workflow_idle_seconds"]),
+                "browser_sessions": int(values["browser_sessions"]),
+                "webview2_instances": int(values["webview2_instances"]),
+                "search_sessions": int(values["search_sessions"]),
                 "permission_mode": {"允许项目内执行": "trusted", "限制执行": "safe",
                                     "完全控制本机": "full_control"}[values["permission_mode"]]}, key_import
 
@@ -170,7 +194,7 @@ class SetupWindow:
         try:
             raw, key_import = self.raw()
         except (ValueError, OSError):
-            self.show("请检查目录和端口，端口应为 1 至 65535 的整数。")
+            self.show("请检查目录和数值配置。端口、并行数量和空闲释放时间都应填写整数。")
             return
         def save():
             save_settings(self.path, raw, key_import=key_import)

@@ -42,6 +42,37 @@ class WorkflowResources:
             self.close()
             raise
 
+    def idle_blockers(self):
+        """Observe owned resources while the registry holds this workflow's gate."""
+        blockers = []
+        if self.coding.owned_job.active_pids():
+            blockers.append("running_commands")
+        with self.host.bf.lock:
+            if self.host.bf.closed or self.host.bf.failure:
+                raise RuntimeError("DESKTOP_RESOURCE_STATE_UNKNOWN")
+            if any(not future.done() for future in self.host.bf.pending.get(self.bf_token, ())):
+                blockers.append("desktop_operations")
+        store = self.host.bf_server._bf_store
+        with store._lock:
+            _, record = store.require(self.bf_token)
+            task_key = record["task_key"]
+            if any(job.active_pids() for job in store._owned_jobs.get(task_key, ())):
+                blockers.append("native_applications")
+        browser = getattr(self.host.bf_server, "_bf_browser_manager", None)
+        if browser is not None:
+            with browser.lock:
+                if any(session.owner == task_key for session in browser.sessions.values()):
+                    blockers.append("browser_sessions")
+        hybrid = getattr(self.host.bf_server, "_bf_hybrid_manager", None)
+        if hybrid is not None:
+            with hybrid._lock:
+                if (any(instance.owner == task_key for instance in hybrid.instances.values())
+                        or task_key in hybrid._pending.values()
+                        or any(owner == task_key for owner, _ in hybrid._failed_launches.values())):
+                    blockers.append("webview2_instances")
+        blockers.extend(self.host.searches.idle_blockers(self.key))
+        return blockers
+
     def close(self):
         errors = []
         try:
@@ -75,11 +106,12 @@ class UnifiedRuntime(Runtime):
         super().__init__(config.workspace_root, auth_token=auth_token, permission_mode=config.runtime_permission_mode,
                          project_context=context, transport="http")
         self.telemetry = LocalTelemetry()
-        self.catalog = unified_catalog(bf_server, full_control=config.full_control)
+        self.catalog = unified_catalog(bf_server, full_control=config.full_control,
+                                       search_sessions=config.search_sessions)
         self.validators = {k: Draft202012Validator(v["inputSchema"]) for k, v in self.catalog.items()}
         self._exposed_tool_names = list(self.catalog)
         self._exposed_tool_name_set = frozenset(self.catalog)
-        self.searches = SearchManager(rg=rg_path)
+        self.searches = SearchManager(rg=rg_path, max_sessions=config.search_sessions)
         self.operations = OperationJournal(config.data_root / "operations.sqlite3")
         self.bf = BFExecutor(bf_server)
         try:
@@ -106,6 +138,8 @@ class UnifiedRuntime(Runtime):
             args = dict(arguments)
             if name == "server_info":
                 info = self.server_info_payload()
+                browser = getattr(self.bf_server, "_bf_browser_manager", None)
+                hybrid = getattr(self.bf_server, "_bf_hybrid_manager", None)
                 if self.config.full_control:
                     info["exec_policy"]["secret_env_filter"] = "enabled"
                 return tool_result({**info, "ok": True, "server": "unified-personal-mcp",
@@ -113,12 +147,22 @@ class UnifiedRuntime(Runtime):
                     "device_label": self.config.device_label, "permission_mode": self.config.permission_mode,
                     "filesystem_scope": "current_windows_user" if self.config.full_control else "workflow_project",
                     "absolute_paths_allowed": self.config.full_control,
+                    "concurrency": {"project_limit": None, "commands_per_workflow": 16,
+                        "browser_sessions": browser.max_sessions if browser else 0,
+                        "webview2_instances": hybrid.max_managed if hybrid else 0,
+                        "search_sessions": self.searches.max_sessions,
+                        "search_sessions_per_workflow": self.searches.max_per_owner,
+                        "foreground_input": 1, "workflow_idle_seconds": self.config.workflow_idle_seconds},
                     "working_directory": "Set exec_command.workdir per call; other workflows are unchanged."})
             if name == "UnifiedTask":
                 action = args.pop("action")
                 if action == "begin":
                     result = self.registry.begin(self.principal, args["project_path"], args["request_id"],
                                                  args.get("access", "write"), args.get("ttl", 120))
+                elif action == "list":
+                    result = self.registry.list(self.principal)
+                elif action == "release_idle":
+                    result = self.registry.release_idle(self.principal, args["workflow_ref"])
                 else:
                     result = getattr(self.registry, action)(self.principal, args["workflow_id"])
                 return tool_result(result)
@@ -150,7 +194,7 @@ class UnifiedRuntime(Runtime):
                         lambda: self.bf.call(name, {"bf_task_id": resource.bf_token, **args}))
                 return self.bf.call(name, {"bf_task_id": resource.bf_token, **args})
         except WorkflowError as exc:
-            return tool_result({"ok": False, "error": {"code": exc.code}})
+            return tool_result({"ok": False, "error": {"code": exc.code, "details": exc.details}})
         except ValidationError:
             return tool_result({"ok": False, "error": {"code": "INVALID_ARGUMENT"}})
         except (ValueError, PermissionError, FileNotFoundError):

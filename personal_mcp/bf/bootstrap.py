@@ -30,7 +30,7 @@ def _wrap_upstream_tool(mcp, parent, *, store, lease):
 
 
 def build_mcp(*, state_root, allowed_root, apps_dir=None, controller_factory=None,
-              browser_config_path=None, full_control=False):
+              browser_config_path=None, full_control=False, max_hybrid_instances=2):
     from fastmcp import FastMCP
     from windows_mcp.tools import register_all
     from bf_automation.bf_tools import register_bf_tools
@@ -73,7 +73,7 @@ def build_mcp(*, state_root, allowed_root, apps_dir=None, controller_factory=Non
             from bf_automation.browser.manager import BrowserManager
             from bf_automation.browser.tools import register_browser_tools
             from bf_automation.hybrid.manager import HybridManager
-            hybrid = HybridManager(store, register_end_hook=False)
+            hybrid = HybridManager(store, register_end_hook=False, max_managed=max_hybrid_instances)
             manager = BrowserManager(store, browser_config_path, apps,
                 source_root=Path(__file__).resolve().parents[2], hybrid_manager=hybrid)
             mcp._bf_browser_manager, mcp._bf_hybrid_manager = manager, hybrid

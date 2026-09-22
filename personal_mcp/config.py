@@ -18,6 +18,10 @@ class AppConfig:
     tunnel_key_file: Path | None
     device_label: str = "My development PC"
     tunnel_key_env: str | None = None
+    workflow_idle_seconds: int = 1800
+    browser_sessions: int = 8
+    webview2_instances: int = 4
+    search_sessions: int = 16
 
     @property
     def full_control(self) -> bool:
@@ -55,7 +59,8 @@ def load_config(path: str | Path) -> AppConfig:
     path = Path(path).resolve(strict=True)
     raw = json.loads(path.read_text(encoding="utf-8"))
     required = {"schema_version", "workspace_root", "data_root", "tunnel"}
-    _fields(raw, required | {"host", "port", "permission_mode", "device_label"}, required)
+    capacity_fields = {"workflow_idle_seconds", "browser_sessions", "webview2_instances", "search_sessions"}
+    _fields(raw, required | {"host", "port", "permission_mode", "device_label"} | capacity_fields, required)
     if type(raw["schema_version"]) is not int or raw["schema_version"] != 1:
         raise ValueError("unsupported schema_version")
 
@@ -79,6 +84,19 @@ def load_config(path: str | Path) -> AppConfig:
     mode = raw.get("permission_mode", "safe")
     if mode not in {"safe", "trusted", "full_control"}:
         raise ValueError("permission_mode must be safe, trusted or full_control")
+    capacities = {}
+    for name, default, minimum, maximum in (
+        ("workflow_idle_seconds", 1800, 300, 86400),
+        ("browser_sessions", 8, 1, 32),
+        ("webview2_instances", 4, 1, 16),
+        ("search_sessions", 16, 1, 64),
+    ):
+        value = raw.get(name, default)
+        if type(value) is not int or not minimum <= value <= maximum:
+            raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+        capacities[name] = value
+    if capacities["webview2_instances"] > capacities["browser_sessions"]:
+        raise ValueError("webview2_instances must not exceed browser_sessions")
     tunnel = raw["tunnel"]
     _fields(tunnel, {"id", "key_file", "key_env"}, {"id"})
     if ("key_file" in tunnel) == ("key_env" in tunnel):
@@ -95,4 +113,5 @@ def load_config(path: str | Path) -> AppConfig:
     label = raw.get("device_label", "My development PC")
     if not isinstance(label, str) or not 1 <= len(label.strip()) <= 100:
         raise ValueError("device_label must be 1 to 100 characters")
-    return AppConfig(path, workspace, private, host, port, mode, tunnel["id"], key, label.strip(), key_env)
+    return AppConfig(path, workspace, private, host, port, mode, tunnel["id"], key, label.strip(), key_env,
+                     **capacities)

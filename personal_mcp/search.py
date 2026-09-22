@@ -33,12 +33,16 @@ class Search:
 
 
 class SearchManager:
-    def __init__(self, *, rg=None, max_records=10000, max_bytes=8 * 1024 * 1024, max_seconds=60):
+    def __init__(self, *, rg=None, max_records=10000, max_bytes=8 * 1024 * 1024, max_seconds=60,
+                 max_sessions=4):
         self.rg = rg or shutil.which("rg")
         self.max_records, self.max_bytes = max_records, max_bytes
         self.sessions = {}
         self.lock = threading.RLock()
         self.closed = False
+        if type(max_sessions) is not int or not 1 <= max_sessions <= 64:
+            raise ValueError("INVALID_SEARCH_SESSION_LIMIT")
+        self.max_sessions, self.max_per_owner = max_sessions, 2
         if not 0 < max_seconds <= 300:
             raise ValueError("INVALID_SEARCH_TIMEOUT")
         self.max_seconds = max_seconds
@@ -60,7 +64,8 @@ class SearchManager:
         with self.lock:
             if self.closed:
                 raise RuntimeError("SEARCH_MANAGER_CLOSED")
-            if len(self.sessions) >= 4 or sum(s.owner == owner for s in self.sessions.values()) >= 2:
+            if (len(self.sessions) >= self.max_sessions
+                    or sum(s.owner == owner for s in self.sessions.values()) >= self.max_per_owner):
                 raise ValueError("SEARCH_SESSION_LIMIT")
             flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             job = OwnedJob()
@@ -141,6 +146,21 @@ class SearchManager:
                     session.state = "failed" if failed or code not in (0, 1) else "completed"
                     if session.state == "failed":
                         session.reason = "RIPGREP_FAILED"
+
+    def occupancy(self, owner=None):
+        with self.lock:
+            sessions = list(self.sessions.values())
+            return {"used": len(sessions), "running": sum(s.state == "running" for s in sessions),
+                    "limit": self.max_sessions, "owner_used": sum(s.owner == owner for s in sessions),
+                    "owner_limit": self.max_per_owner}
+
+    def idle_blockers(self, owner):
+        with self.lock:
+            sessions = [s for s in self.sessions.values() if s.owner == owner]
+        for session in sessions:
+            if session.process.poll() is None or (session.thread is not None and session.thread.is_alive()):
+                return ["running_search"]
+        return []
 
     def _owned(self, owner, search_id):
         with self.lock:

@@ -6,6 +6,7 @@ from copy import deepcopy
 from coding_tools_mcp.server import TOOL_REGISTRY, tool_definition
 
 WORKFLOW = {"type": "string", "pattern": "^wf_[A-Za-z0-9_-]{43}$"}
+WORKFLOW_REF = {"type": "string", "pattern": "^wfr_[0-9a-f]{64}$"}
 TEXT = {"type": "string", "minLength": 1, "maxLength": 128}
 
 
@@ -18,7 +19,7 @@ def definition(name, description, properties, required, output, *, readonly=Fals
                             "idempotentHint": False, "openWorldHint": False}}
 
 
-def unified_catalog(bf_server, *, full_control=False):
+def unified_catalog(bf_server, *, full_control=False, search_sessions=4):
     tools = {name: deepcopy(tool_definition(name)) for name in TOOL_REGISTRY}
     for tool in asyncio.run(bf_server.list_tools()):
         if tool.name in {"task_context", "task_diagnostics"}:
@@ -57,17 +58,35 @@ def unified_catalog(bf_server, *, full_control=False):
     task_output = {"type": "object", "required": ["ok"], "properties": {
         "ok": {"type": "boolean"}, "state": {"type": "string"}, "code": {"type": "string"},
         "workflow_id": WORKFLOW, "project": {"type": "string"}, "access": {"enum": ["read", "write"]},
+        "workflow_ref": WORKFLOW_REF, "created": {"type": "number"},
+        "last_activity": {"type": "number"}, "idle_seconds": {"type": "number"},
+        "workflows": {"type": "array", "items": {"type": "object"}},
         "expires": {"type": "number"}, "instructions": {"type": "string"}, "error": {"type": "object"}}}
     task = definition("UnifiedTask",
         "Begin a project workflow, keep its one-time workflow_id, then activate it. End releases owned resources. "
-        "A repeated begin never returns the secret again; if its first reply was lost, wait for reservation expiry and use a new request_id.",
-        {"action": {"enum": ["begin", "activate", "status", "end"]}, "workflow_id": WORKFLOW,
+        "Different projects run concurrently. Use the concrete project directory, not a shared parent; "
+        "call shared build scripts by absolute path while keeping that project. For simultaneous edits to one "
+        "project, use separate working copies. list shows your workflow_refs and project owners without tokens. "
+        "release_idle accepts a workflow_ref only after the configured idle period and only when no operation "
+        "or owned resource is running. Busy or unknown resources are retained. Idle sessions are also reaped "
+        "automatically. A repeated begin never returns the secret again; if its first reply was lost, "
+        "wait for reservation expiry and use a new request_id.",
+        {"action": {"enum": ["begin", "activate", "status", "end", "list", "release_idle"]},
+         "workflow_id": WORKFLOW, "workflow_ref": WORKFLOW_REF,
          "project_path": {"type": "string", "minLength": 1}, "request_id": TEXT,
          "access": {"enum": ["read", "write"], "default": "write"},
          "ttl": {"type": "integer", "minimum": 1, "maximum": 300, "default": 120}}, ["action"], task_output)
-    task["inputSchema"]["allOf"] = [{"if": {"properties": {"action": {"const": "begin"}}},
-        "then": {"required": ["project_path", "request_id"], "not": {"required": ["workflow_id"]}},
-        "else": {"required": ["workflow_id"], "not": {"anyOf": [{"required": [x]} for x in ("project_path", "request_id", "access", "ttl")]}}}]
+    properties = task["inputSchema"]["properties"]
+    task["inputSchema"]["oneOf"] = []
+    for actions, required, allowed in (
+        (["begin"], ["project_path", "request_id"], {"action", "project_path", "request_id", "access", "ttl"}),
+        (["activate", "status", "end"], ["workflow_id"], {"action", "workflow_id"}),
+        (["list"], [], {"action"}),
+        (["release_idle"], ["workflow_ref"], {"action", "workflow_ref"}),
+    ):
+        task["inputSchema"]["oneOf"].append({"properties": {"action": {"enum": actions}},
+            "required": ["action", *required],
+            "not": {"anyOf": [{"required": [key]} for key in properties if key not in allowed]}})
     tools["UnifiedTask"] = task
     search_output = {"type": "object", "required": ["ok"], "properties": {
         "ok": {"type": "boolean"}, "search_id": {"type": "string"}, "state": {"type": "string"},
@@ -76,7 +95,7 @@ def unified_catalog(bf_server, *, full_control=False):
             "properties": {"path": {"type": "string"}, "line": {"type": "integer"}, "text": {"type": "string"}},
             "required": ["path", "line", "text"]}}, "error": {"type": "object"}}}
     search = definition("SearchSession", "Start/read/status/stop/release a bounded progressive search in this workflow's project. "
-        "Use nonnegative absolute cursors. At most 2 retained sessions per workflow and 4 per host. "
+        f"Use nonnegative absolute cursors. At most 2 retained sessions per workflow and {search_sessions} per host. "
         "stop retains results; release stops and forgets one search, freeing its slot without ending the workflow.",
         {"action": {"enum": ["start", "read", "status", "stop", "release"]}, "workflow_id": WORKFLOW,
          "pattern": {"type": "string", "minLength": 1, "maxLength": 1024}, "regex": {"type": "boolean"},
