@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 
 from personal_mcp.coding import build_coding
 from personal_mcp.config import load_config
@@ -17,7 +18,11 @@ def test_filtered_environment_is_repaired_without_reintroducing_secrets(tmp_path
         assert "OPENAI_API_KEY" not in env
         assert os.environ["PATHEXT"] == ".CPL"
         assert env["USERPROFILE"] == str(runtime.command_home_dir())
-        result = runtime.exec_command({"cmd": "where cmd.exe", "yield_time_ms": 1000})
+        result = runtime.exec_command({"cmd": "where cmd.exe", "yield_time_ms": 0})
+        deadline = time.monotonic() + 15
+        while result["exit_code"] is None and time.monotonic() < deadline:
+            result = runtime.write_stdin({"command_id": result["command_id"], "chars": "",
+                                          "yield_time_ms": 1000})
         assert result["exit_code"] == 0, result
     finally:
         runtime.close()
