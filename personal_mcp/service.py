@@ -56,8 +56,13 @@ class LocalService:
         self.stopping = threading.Event()
         self.failure = None
         self._tunnel_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
 
     def start(self, *, connect_tunnel=False):
+        with self._lifecycle_lock:
+            return self._start(connect_tunnel=connect_tunnel)
+
+    def _start(self, *, connect_tunnel=False):
         if self.guard is not None:
             raise RuntimeError("INSTANCE_ALREADY_RUNNING")
         self.guard = InstanceLock("installation:" + str(self.config.data_root.resolve()))
@@ -71,7 +76,8 @@ class LocalService:
             if key_path.stat().st_size > 1024:
                 raise ValueError("BACKEND_KEY_INVALID")
             key = key_path.read_text(encoding="utf-8").strip()
-            if len(key) < 32 or any(c.isspace() for c in key):
+            if (len(key) < 32 or not key.isascii()
+                    or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in key)):
                 raise ValueError("BACKEND_KEY_INVALID")
             control_path = self.config.data_root / 'control.key'
             if not control_path.exists():
@@ -80,7 +86,7 @@ class LocalService:
                 raise ValueError('CONTROL_KEY_INVALID')
             control_key = control_path.read_text(encoding='utf-8').strip()
             if (len(control_key) < 32 or not control_key.isascii()
-                    or any(c.isspace() or ord(c) < 32 for c in control_key)
+                    or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in control_key)
                     or secrets.compare_digest(control_key, key)):
                 raise ValueError('CONTROL_KEY_INVALID')
             python = self.assets / "python" / "python.exe"
@@ -130,6 +136,8 @@ class LocalService:
             'recovery_attempts': 0, 'next_retry': None}
         running = bool(self.server and self.http_thread and self.http_thread.is_alive())
         status = component['status'] if component['status'] != 'disabled' else 'healthy'
+        if self.failure:
+            status = 'degraded'
         return {'status': status if running else 'stopped', 'tunnel': component}
 
     def status(self):
@@ -164,6 +172,10 @@ class LocalService:
                     pass
 
     def stop(self):
+        with self._lifecycle_lock:
+            self._stop()
+
+    def _stop(self):
         with self._tunnel_lock:
             self.stopping.set()
             tunnel = self.tunnel

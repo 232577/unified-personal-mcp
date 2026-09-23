@@ -89,3 +89,38 @@ def test_process_creation_returns_before_readiness_and_owns_cleanup(tmp_path, mo
     finally:
         runner.close()
     assert jobs[0].closed
+
+
+def test_readiness_redirect_does_not_report_another_endpoint_as_healthy(tmp_path):
+    import http.server
+    import threading
+    from personal_mcp.tunnel import TunnelRunner
+
+    visited = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            visited.append(self.path)
+            self.send_response(302 if self.path == '/readyz' else 200)
+            if self.path == '/readyz':
+                self.send_header('Location', '/unrelated-service')
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    cfg = load_config(installation(tmp_path))
+    cfg.data_root.mkdir()
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    (cfg.data_root / 'tunnel-health.url').write_text(f'http://127.0.0.1:{server.server_port}')
+    runner = TunnelRunner(cfg, None, 'fixture-backend-key')
+    runner.process = type('Process', (), {'poll': lambda self: None})()
+    try:
+        assert not runner.ready()
+        assert visited == ['/readyz']
+    finally:
+        server.shutdown()
+        worker.join(2)
+        server.server_close()

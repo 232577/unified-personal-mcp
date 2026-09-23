@@ -64,6 +64,10 @@ def unified_catalog(bf_server, *, full_control=False, search_sessions=4):
             schema["properties"]["request_id"] = deepcopy(TEXT)
             schema["required"] = list(dict.fromkeys([*schema["required"], "request_id"]))
             tool["description"] += " Supply a unique request_id for this operation; repeats never replay an unknown outcome."
+            if name == "write_stdin":
+                tool["description"] += (
+                    " Each new output poll needs a new request_id, even when chars is empty; "
+                    "reuse the same ID only to retry a lost reply to that exact poll.")
     task_output = {"type": "object", "required": ["ok"], "properties": {
         "ok": {"type": "boolean"}, "state": {"type": "string"}, "code": {"type": "string"},
         "workflow_id": WORKFLOW, "project": {"type": "string"}, "access": {"enum": ["read", "write"]},
@@ -106,9 +110,12 @@ def unified_catalog(bf_server, *, full_control=False, search_sessions=4):
         (["resume"], ["workflow_ref", "request_id", "expected_generation"],
          {"action", "workflow_ref", "request_id", "expected_generation"}),
     ):
-        task["inputSchema"]["oneOf"].append({"properties": {"action": {"enum": actions}},
-            "required": ["action", *required],
-            "not": {"anyOf": [{"required": [key]} for key in properties if key not in allowed]}})
+        # Union-aware clients generate each branch's callable signature without
+        # merging the parent properties. Keep every branch self-contained.
+        branch = {key: deepcopy(value) for key, value in properties.items() if key in allowed}
+        branch["action"] = {"enum": actions}
+        task["inputSchema"]["oneOf"].append({"type": "object", "properties": branch,
+            "required": ["action", *required], "additionalProperties": False})
     tools["UnifiedTask"] = task
     tools['OperationStatus'] = definition('OperationStatus',
         'Query a previously submitted request_id in this workflow without repeating its side effects. '

@@ -68,9 +68,9 @@ class HybridManager:
     def _task(self, token):
         return self.store.require(token)
 
-    def _owned(self, token, hybrid_instance_id):
+    def _owned(self, token, hybrid_instance_id, *, allow_ending=False):
         validate_hybrid_instance_id(hybrid_instance_id)
-        _, task = self._task(token)
+        _, task = self.store.require(token, allow_ending=allow_ending)
         with self._lock:
             instance = self.instances.get(hybrid_instance_id)
         if instance is None or instance.owner != task['task_key']:
@@ -181,6 +181,7 @@ class HybridManager:
                 launch_root=launch_root,
             )
             with self._lock:
+                self._task(token)
                 self.instances[instance_id] = instance
             return instance
         except BaseException:
@@ -223,6 +224,7 @@ class HybridManager:
         if webview.pid not in self.platform.listener_pids(port):
             raise RuntimeError('DEBUG_ENDPOINT_NOT_OWNED')
         with self._lock:
+            self._task(token)
             if any(item.owner == task['task_key'] for item in self.instances.values()):
                 raise ValueError('HYBRID_INSTANCE_LIMIT_REACHED')
             instance_id = 'bfh_' + uuid.uuid4().hex
@@ -258,7 +260,7 @@ class HybridManager:
         }
 
     def release(self, token, hybrid_instance_id):
-        instance = self._owned(token, hybrid_instance_id)
+        instance = self._owned(token, hybrid_instance_id, allow_ending=True)
         if instance.ownership == 'managed':
             termination_identity = instance.launch_root or instance.shell
             owns_job = getattr(self.platform, 'owns_job', lambda value: False)(termination_identity)
@@ -296,8 +298,10 @@ class HybridManager:
         }
 
     def end_task(self, token):
-        _, task = self.store.require(token)
+        _, task = self.store.require(token, allow_ending=True)
         with self._lock:
+            if task['task_key'] in self._pending.values():
+                raise RuntimeError('HYBRID_OPERATIONS_STILL_RUNNING')
             owned = [item.hybrid_instance_id for item in self.instances.values()
                      if item.owner == task['task_key']]
         for hybrid_instance_id in owned:

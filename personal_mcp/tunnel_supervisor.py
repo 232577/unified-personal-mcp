@@ -35,6 +35,7 @@ class TunnelSupervisor:
         self._wake = threading.Event()
         self._runner = self._attempt = self.worker = None
         self._blocked = False
+        self._refresh_credentials = False
         self._starts = self._failures = 0
         self._healthy_since = None
         self._state = {'status': 'disabled', 'last_success': None, 'error_code': None,
@@ -60,6 +61,7 @@ class TunnelSupervisor:
             if self._stop.is_set():
                 raise RuntimeError('TUNNEL_SUPERVISOR_STOPPED')
             self._blocked = False
+            self._refresh_credentials = True
             self._state['next_retry'] = None
         return self.start()
 
@@ -72,7 +74,7 @@ class TunnelSupervisor:
         while not self._stop.is_set():
             with self._lock:
                 due = self._state['next_retry']
-                if (not self._stop.is_set() and not self._blocked
+                if (not self._stop.is_set() and (not self._blocked or self._refresh_credentials)
                         and (self._attempt is None or not self._attempt.is_alive())
                         and (due is None or self._clock() >= due)):
                     self._attempt = threading.Thread(target=self._observe, daemon=True,
@@ -83,7 +85,10 @@ class TunnelSupervisor:
 
     def _dispose(self):
         if self._runner is not None:
-            self._runner.close()
+            try:
+                self._runner.close()
+            except Exception:
+                raise RuntimeError('TUNNEL_CLEANUP_INCOMPLETE') from None
             self._runner = None
 
     def _failed(self, code):
@@ -103,6 +108,11 @@ class TunnelSupervisor:
         try:
             if self._stop.is_set():
                 return
+            with self._lock:
+                refresh = self._refresh_credentials
+                self._refresh_credentials = False
+            if refresh and self._runner is not None and self._runner.credentials_changed():
+                self._dispose()
             if self._runner is None:
                 self._update(status='recovering', next_retry=None,
                              recovery_attempts=self._starts)
@@ -129,7 +139,10 @@ class TunnelSupervisor:
             try:
                 # A live child may be reconnecting itself. Never replace it on a probe error.
                 if self._runner is not None and self._runner.is_alive():
-                    self._update(status='degraded', error_code='TUNNEL_NOT_READY', next_retry=None)
+                    if code in _ACTION_REQUIRED:
+                        self._failed(code)
+                    else:
+                        self._update(status='degraded', error_code='TUNNEL_NOT_READY', next_retry=None)
                     return
                 self._dispose()
             except Exception:

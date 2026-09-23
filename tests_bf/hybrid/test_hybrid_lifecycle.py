@@ -1,4 +1,6 @@
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 import pytest
 
@@ -271,3 +273,73 @@ def test_packaged_launcher_may_spawn_the_real_gui_shell(tmp_path):
     result = manager.release(token, instance.hybrid_instance_id)
     assert result['process_terminated'] is True
     assert platform.terminated == [platform.launch_root]
+
+
+def test_task_end_waits_for_pending_hybrid_launch_cleanup(tmp_path, monkeypatch):
+    project, executable, store, platform, manager = manager_for(tmp_path)
+    token = store.begin(project)['bf_task_id']
+    entered, release = threading.Event(), threading.Event()
+    launch = platform.launch
+
+    def gated_launch(**kwargs):
+        entered.set()
+        assert release.wait(3)
+        return launch(**kwargs)
+
+    monkeypatch.setattr(platform, 'launch', gated_launch)
+    with ThreadPoolExecutor(1) as pool:
+        launching = pool.submit(manager.prepare_managed, token, make_profile(project, executable))
+        try:
+            assert entered.wait(1)
+            with pytest.raises(RuntimeError, match='TASK_CLEANUP_INCOMPLETE'):
+                store.end(token)
+        finally:
+            release.set()
+        with pytest.raises(PermissionError, match='TASK_ENDING'):
+            launching.result(3)
+    assert platform.terminated == [platform.shell]
+    assert store.end(token)['status'] == 'ended'
+    assert not manager.instances and not manager._pending
+
+
+def test_attachment_cannot_publish_after_task_ends_during_identity_check(tmp_path, monkeypatch):
+    project, executable, store, platform, manager = manager_for(tmp_path)
+    token = store.begin(project)['bf_task_id']
+    window_id = store.bind_window(token, hwnd=500, pid=platform.shell.pid, title='U4A Fixture')
+    window = {**store.resolve_window(token, window_id), 'window_id': window_id}
+    manager.attach_resolver = Resolver({
+        'endpoint': 'http://127.0.0.1:53123', 'webview_pid': platform.webview.pid,
+        'webview_created': platform.webview.create_time, 'engine_version': '153.0.4234.32',
+    })
+    listener_pids = platform.listener_pids
+
+    def end_before_publication(port):
+        pids = listener_pids(port)
+        store.end(token)
+        return pids
+
+    monkeypatch.setattr(platform, 'listener_pids', end_before_publication)
+    with pytest.raises(PermissionError):
+        manager.attach_existing(token, make_profile(project, executable, ownership='attached'), window)
+    assert not manager.instances
+    assert not platform.terminated
+
+
+def test_managed_instance_cannot_publish_once_task_cleanup_has_started(tmp_path, monkeypatch):
+    project, executable, store, platform, manager = manager_for(tmp_path)
+    token = store.begin(project)['bf_task_id']
+    bind = store.bind_window
+
+    def end_before_publication(*args, **kwargs):
+        window_id = bind(*args, **kwargs)
+        try:
+            store.end(token)
+        except RuntimeError as error:
+            assert str(error) == 'TASK_CLEANUP_INCOMPLETE'
+        return window_id
+
+    monkeypatch.setattr(store, 'bind_window', end_before_publication)
+    with pytest.raises(PermissionError):
+        manager.prepare_managed(token, make_profile(project, executable))
+    assert not manager.instances and not manager._pending
+    assert platform.terminated == [platform.shell]

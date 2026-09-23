@@ -26,8 +26,10 @@ def orphan(host):
                   cmd=subprocess.list2cmdline([sys.executable, '-c', code, str(marker)]),
                   yield_time_ms=0)['structuredContent']
     deadline = time.monotonic() + 10
+    poll = 0
     while result['exit_code'] is None and time.monotonic() < deadline:
-        result = call(host, 'write_stdin', workflow_id=token, request_id='poll',
+        poll += 1
+        result = call(host, 'write_stdin', workflow_id=token, request_id=f'poll-{poll}',
                       command_id=result['command_id'], chars='', yield_time_ms=100)['structuredContent']
     assert result['exit_code'] == 0, result
     child = int(marker.read_text())

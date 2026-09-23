@@ -304,6 +304,10 @@ class WorkflowRegistry:
                        "VALUES (?,?,?,?,?,?,?,?,?,NULL,?)",
                        (key, owner.key, request_id, digest, str(project), access, "RESERVED", now + ttl, now, now))
             db.execute('INSERT INTO workflow_credentials VALUES (?,?,0,0)', (key, key))
+            db.commit()
+            for row in self._metadata.values():
+                if row['state'] == 'RESERVED' and row['expires'] <= now:
+                    row['state'] = 'EXPIRED'
             self._metadata[key] = dict(db.execute('SELECT * FROM workflows WHERE token_hash=?', (key,)).fetchone())
             self.workflow_locks[key] = threading.RLock()
         return {"ok": True, "workflow_id": token, "state": "RESERVED", "expires": now + ttl,
@@ -340,6 +344,9 @@ class WorkflowRegistry:
         with gate:
             with self.lock:
                 row = self._row(owner, token)
+                if row['state'] == 'RESERVED' and row['expires'] <= self.clock():
+                    self._state(key, 'EXPIRED')
+                    raise WorkflowError('WORKFLOW_INACTIVE')
                 if self.closed or row["state"] not in {"RESERVED", "ACTIVE"}:
                     raise WorkflowError("WORKFLOW_INACTIVE")
                 if row['state'] == 'ACTIVE':

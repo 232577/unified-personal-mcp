@@ -523,3 +523,42 @@ def test_service_identity_check_rejects_another_configuration_before_retry(tmp_p
     monkeypatch.setattr(autostart.psutil, 'Process', lambda pid: Process())
     result = autostart.service_process_status({'running': True, 'pid': 1234, 'updated': 20}, item.config)
     assert result == {'running': False}
+
+
+def test_registration_detects_external_changes_with_same_installation_target(tmp_path):
+    class InterleavedScheduler(FakeScheduler):
+        def register(self, name, bundle, config):
+            receipt = super().register(name, bundle, config)
+            self.current['xml'] = '<Task>external same-target update</Task>'
+            return receipt
+
+    scheduler = InterleavedScheduler()
+    item = manager(tmp_path, scheduler=scheduler)
+    with pytest.raises(RuntimeError, match='AUTOSTART_UPDATE_CONFLICT'):
+        item.enable(packaged(tmp_path), expected_version='0.1.6')
+    assert scheduler.current['xml'] == '<Task>external same-target update</Task>'
+    assert scheduler.calls == ['register']
+
+
+@pytest.mark.parametrize('explicit_config', [False, True])
+def test_service_identity_recognizes_service_owned_by_another_gui(tmp_path, monkeypatch, explicit_config):
+    from personal_mcp import autostart
+    item = manager(tmp_path)
+    monkeypatch.setattr('personal_mcp.__main__.default_config_path', lambda: item.config.path)
+
+    class Process:
+        pid = 1234
+
+        def create_time(self):
+            return 10
+
+        def cmdline(self):
+            result = ['pythonw.exe', 'run.py', 'gui']
+            if explicit_config:
+                result.extend(['--config', str(item.config.path)])
+            return result
+
+    monkeypatch.setattr(autostart.psutil, 'Process', lambda pid: Process())
+    result = autostart.service_process_status(
+        {'running': True, 'pid': 1234, 'updated': 20, 'version': '0.1.7'}, item.config)
+    assert result['running'] and result['running_version'] == '0.1.7'

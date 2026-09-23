@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unified-personal-mcp"
-version = "0.1.7"
+version = "0.1.8"
 description = "One configurable Windows host for coding, desktop and browser tools over an OpenAI Secure MCP Tunnel."
 requires-python = ">=3.13,<3.14"
 dependencies = [

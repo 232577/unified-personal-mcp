@@ -5,7 +5,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
-from tests_bf.browser.test_lifecycle import manager_for
+from tests_bf.browser.test_lifecycle import manager_for, register
 
 from bf_automation.browser.manager import Session
 from bf_automation.browser.models import WebProfile
@@ -84,3 +84,24 @@ def test_task_end_interrupts_owned_worker_instead_of_waiting_for_request_timeout
         finally:
             stop.set()
     manager.shutdown()
+
+
+def test_start_does_not_reserve_a_session_after_its_task_ended(tmp_path, monkeypatch):
+    store, manager, project = manager_for(tmp_path)
+    register(manager, project, SimpleNamespace(origin='http://127.0.0.1:65533'))
+    token = store.begin(project)['bf_task_id']
+    from bf_automation.browser import manager as browser_module
+    load_profile = browser_module.load_browser_profile
+
+    def end_during_profile_read(*args):
+        profile = load_profile(*args)
+        store.end(token)
+        return profile
+
+    monkeypatch.setattr(browser_module, 'load_browser_profile', end_during_profile_read)
+    try:
+        with pytest.raises(PermissionError):
+            manager.start(token, 'fixture', 'start-after-end')
+        assert not manager.sessions, 'ended task must not consume a browser session slot'
+    finally:
+        manager.shutdown()

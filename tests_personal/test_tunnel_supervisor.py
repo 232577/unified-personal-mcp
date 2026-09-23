@@ -29,6 +29,9 @@ class FakeRunner:
     def ready(self):
         return self.alive and self.available
 
+    def credentials_changed(self):
+        return False
+
     def close(self):
         self.closes += 1
         self.alive = False
@@ -224,3 +227,104 @@ def test_supervised_real_owned_children_from_pythonw_never_open_console(tmp_path
     assert len(readings) >= 2
     assert set(readings) == {'0'}
     assert json.loads(result.read_text())['status'] == 'stopped'
+
+
+@pytest.mark.parametrize('replacement', ['fixture-replacement-cloud-key-123456789', None, 'invalid'])
+def test_explicit_retry_reloads_changed_key_without_replacing_unchanged_live_child(tmp_path, monkeypatch, replacement):
+    from personal_mcp import tunnel
+    from personal_mcp.config import load_config
+    from personal_mcp.tunnel_supervisor import TunnelSupervisor
+    from tests_personal.test_config import installation
+
+    cfg = load_config(installation(tmp_path))
+    cfg.data_root.mkdir()
+    cfg.tunnel_key_file.write_text('fixture-original-cloud-key-123456789')
+    jobs = []
+
+    class Process:
+        pid = 123
+        alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def wait(self, timeout):
+            assert not self.alive
+
+    class Job:
+        def __init__(self):
+            self.process = Process()
+            self.key = None
+            jobs.append(self)
+
+        def spawn(self, args, **kwargs):
+            self.key = kwargs['env']['UPM_TUNNEL_RUN_KEY']
+            return self.process
+
+        def close(self):
+            self.process.alive = False
+
+    monkeypatch.setattr(tunnel, 'verify_client', lambda binary: binary)
+    monkeypatch.setattr(tunnel, 'assert_tunnel_available', lambda ident: None)
+    monkeypatch.setattr(tunnel, 'OwnedJob', Job)
+    monitor = TunnelSupervisor(cfg, tmp_path / 'fixture.exe', 'fixture-backend-key', poll_interval=0.01)
+    try:
+        monitor.start()
+        eventually(lambda: monitor.snapshot()['status'] == 'degraded')
+        monitor.retry()
+        time.sleep(0.05)
+        assert len(jobs) == 1 and jobs[0].process.alive
+        if replacement is None:
+            cfg.tunnel_key_file.unlink()
+        else:
+            cfg.tunnel_key_file.write_text(replacement)
+        monitor.retry()
+        if replacement is None or replacement == 'invalid':
+            code = 'TUNNEL_KEY_UNAVAILABLE' if replacement is None else 'TUNNEL_KEY_INVALID'
+            eventually(lambda: monitor.snapshot()['error_code'] == code)
+            assert len(jobs) == 1 and jobs[0].process.alive
+        else:
+            eventually(lambda: len(jobs) == 2)
+            assert not jobs[0].process.alive
+            assert jobs[1].key == 'fixture-replacement-cloud-key-123456789'
+    finally:
+        monitor.close()
+    assert not any(job.process.alive for job in jobs)
+
+
+@pytest.mark.parametrize('failure', [RuntimeError('TUNNEL_CLEANUP_INCOMPLETE'),
+                                      OSError('private cleanup diagnostic')])
+def test_key_rotation_cleanup_failure_stays_degraded_until_explicit_retry(monkeypatch, failure):
+    class RotatedRunner(FakeRunner):
+        changed = False
+        cleanup_fails = True
+
+        def credentials_changed(self):
+            return self.changed
+
+        def close(self):
+            if self.cleanup_fails:
+                self.closes += 1
+                raise failure
+            super().close()
+
+    first, second = RotatedRunner(), FakeRunner()
+    first.available = second.available = True
+    monitor = supervisor(monkeypatch, [first, second])
+    try:
+        monitor.start()
+        eventually(lambda: monitor.snapshot()['status'] == 'healthy')
+        first.changed = True
+        monitor.retry()
+        eventually(lambda: monitor.snapshot()['error_code'] == 'TUNNEL_CLEANUP_INCOMPLETE')
+        time.sleep(0.05)
+        state = monitor.snapshot()
+        assert state['status'] == 'degraded' and state['next_retry'] is None
+        assert first.alive and first.closes == 1 and second.starts == 0
+        first.cleanup_fails = False
+        monitor.retry()
+        eventually(lambda: second.starts == 1 and monitor.snapshot()['status'] == 'healthy')
+        assert not first.alive and first.closes == 2
+    finally:
+        first.cleanup_fails = False
+        monitor.close()

@@ -19,6 +19,11 @@ CLIENT_VERSION = "0.0.14+0f870e50a973fa820d4c409000059e181e8d242b"
 CLIENT_SHA256 = "fcc85a69ec0ad82518e4f8964f60c45e31787957782a0fc9c1b0c44e82d61b9b"
 
 
+class _NoHealthRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def verify_client(binary):
     path = Path(binary).resolve(strict=True)
     with path.open("rb") as source:
@@ -84,6 +89,7 @@ class TunnelRunner:
     def __init__(self, config, binary, backend_key):
         self.config, self.binary, self.backend_key = config, binary, backend_key
         self.job = self.lock = self.process = None
+        self._credential_digest = None
 
     def start(self):
         if self.process is not None:
@@ -97,7 +103,9 @@ class TunnelRunner:
             profile.write_text(yaml.safe_dump(tunnel_profile(self.config)), encoding="utf-8")
             health = self.config.data_root / "tunnel-health.url"
             health.unlink(missing_ok=True)
-            env = tunnel_environment(read_tunnel_key(self.config), self.backend_key)
+            cloud_key = read_tunnel_key(self.config)
+            env = tunnel_environment(cloud_key, self.backend_key)
+            self._credential_digest = hashlib.sha256(cloud_key.encode('utf-8')).digest()
             self.job = OwnedJob()
             self.process = self.job.spawn([str(binary), "run", "--profile-file", str(profile),
                 "--mcp.extra-headers", "Authorization: env:UPM_BACKEND_AUTHORIZATION",
@@ -115,6 +123,10 @@ class TunnelRunner:
     def is_alive(self):
         return self.process is not None and self.process.poll() is None
 
+    def credentials_changed(self):
+        value = read_tunnel_key(self.config)
+        return hashlib.sha256(value.encode('utf-8')).digest() != self._credential_digest
+
     def ready(self):
         if not self.is_alive():
             return False
@@ -128,7 +140,7 @@ class TunnelRunner:
                     or parsed.username or parsed.password or parsed.path not in ("", "/")
                     or parsed.query or parsed.fragment):
                 return False
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoHealthRedirect())
             with opener.open(url.rstrip("/") + "/readyz", timeout=1) as response:
                 return response.status == 200
         except (OSError, ValueError, urllib.error.URLError):

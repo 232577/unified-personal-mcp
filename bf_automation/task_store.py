@@ -20,6 +20,8 @@ class TaskStore:
         self.tasks_root = self.state_root / "tasks"
         self.tasks_root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._end_locks = {}
+        self._ending = set()
         self._end_hooks = []
         self._owned_jobs = {}
 
@@ -90,7 +92,7 @@ class TaskStore:
             "project_path": str(project),
         }
 
-    def require(self, token: str) -> tuple[Path, dict]:
+    def require(self, token: str, *, allow_ending=False) -> tuple[Path, dict]:
         if not isinstance(token, str) or not token.startswith("bf_"):
             raise PermissionError("invalid bf_task_id")
         key = self._task_key(token)
@@ -100,10 +102,12 @@ class TaskStore:
             raise PermissionError("unknown bf_task_id")
         if record.get("status") != "active":
             raise PermissionError("bf_task_id is not active")
+        if not allow_ending and key in self._ending:
+            raise PermissionError("TASK_ENDING")
         return task_dir, record
 
     def status(self, token: str) -> dict:
-        task_dir, record = self.require(token)
+        task_dir, record = self.require(token, allow_ending=True)
         return {
             "status": record["status"],
             "task_key": record["task_key"],
@@ -115,31 +119,40 @@ class TaskStore:
 
     def end(self, token: str) -> dict:
         with self._lock:
-            task_dir, record = self.require(token)
+            _, record = self.require(token, allow_ending=True)
+            end_lock = self._end_locks.setdefault(record["task_key"], threading.Lock())
+        # Cleanup can wait for a resource whose startup needs the state lock.
+        # Serialize this owner's cleanup separately and fence new admissions.
+        with end_lock:
+            with self._lock:
+                task_dir, record = self.require(token, allow_ending=True)
+                self._ending.add(record["task_key"])
             errors = []
             for hook in self._end_hooks:
                 try:
                     hook(token)
                 except Exception as exc:
                     errors.append(exc)
-            for job in list(self._owned_jobs.get(record["task_key"], [])):
+            with self._lock:
+                for job in list(self._owned_jobs.get(record["task_key"], [])):
+                    try:
+                        job.close()
+                        self._owned_jobs[record["task_key"]].remove(job)
+                    except Exception as exc:
+                        errors.append(exc)
+                if errors:
+                    raise RuntimeError("TASK_CLEANUP_INCOMPLETE") from errors[0]
+                self._owned_jobs.pop(record["task_key"], None)
+                db = self._claims()
                 try:
-                    job.close()
-                    self._owned_jobs[record["task_key"]].remove(job)
-                except Exception as exc:
-                    errors.append(exc)
-            if errors:
-                raise RuntimeError("TASK_CLEANUP_INCOMPLETE") from errors[0]
-            self._owned_jobs.pop(record["task_key"], None)
-            record["status"] = "ended"
-            record["ended"] = time.time()
-            self._write_json(task_dir / "task.json", record)
-            db = self._claims()
-            try:
-                with db:
-                    db.execute("DELETE FROM window_claims WHERE owner = ?", (record["task_key"],))
-            finally:
-                db.close()
+                    with db:
+                        db.execute("DELETE FROM window_claims WHERE owner = ?", (record["task_key"],))
+                finally:
+                    db.close()
+                record["status"] = "ended"
+                record["ended"] = time.time()
+                self._write_json(task_dir / "task.json", record)
+                self._ending.discard(record["task_key"])
         return {"status": "ended", "task_key": record["task_key"]}
 
     def spawn_owned(self, token, *args, **kwargs):
@@ -212,12 +225,12 @@ class TaskStore:
             self._write_json(task_dir / "task.json", record)
 
     def bind_window(self, token: str, *, hwnd: int, pid: int, title: str) -> str:
-        task_dir, _ = self.require(token)
         digest = hashlib.sha256(
             f"{token}\0{int(hwnd)}\0{int(pid)}\0{title}".encode("utf-8")
         ).hexdigest()[:24]
         window_id = f"bfw_{digest}"
         with self._lock:
+            task_dir, _ = self.require(token)
             path = task_dir / "windows.json"
             windows = self._read_json(path, {})
             windows[window_id] = {

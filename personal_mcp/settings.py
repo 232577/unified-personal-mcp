@@ -4,11 +4,12 @@ import json
 import os
 import shutil
 import uuid
+from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
 
 from .config import load_config
-from .protection import prepare_private_directory, read_tunnel_key
+from .protection import InstanceLock, prepare_private_directory, read_tunnel_key
 from .tunnel import assert_tunnel_available, verify_client
 
 
@@ -16,9 +17,28 @@ def save_settings(path, raw, *, key_import=None):
     path = Path(path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     pending = path.parent / (".settings-" + uuid.uuid4().hex + ".local.json")
+    with ExitStack() as guards:
+        guards.callback(InstanceLock('settings:' + str(path)).close)
+        try:
+            pending.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+            cfg = load_config(pending)
+            roots = {cfg.data_root}
+            if path.is_file():
+                try:
+                    roots.add(load_config(path).data_root)
+                except (ValueError, OSError):
+                    pass  # A stopped installation can replace an invalid configuration.
+            for root in sorted(roots):
+                guards.callback(InstanceLock('installation:' + str(root.resolve())).close)
+            return _save_validated(path, pending, cfg, key_import)
+        finally:
+            pending.unlink(missing_ok=True)
+
+
+def _save_validated(path, pending, cfg, key_import):
+    key_backup = key_pending = None
+    imported = False
     try:
-        pending.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-        cfg = load_config(pending)
         if key_import is not None:
             if cfg.tunnel_key_file is None:
                 raise ValueError("KEY_IMPORT_REQUIRES_FILE_SOURCE")
@@ -26,15 +46,28 @@ def save_settings(path, raw, *, key_import=None):
             prepare_private_directory(cfg.data_root)
             cfg.tunnel_key_file.parent.mkdir(parents=True, exist_ok=True)
             key_pending = cfg.tunnel_key_file.with_name(".import-" + uuid.uuid4().hex + ".key")
-            try:
-                key_pending.write_text(value, encoding="utf-8")
-                key_pending.replace(cfg.tunnel_key_file)
-            finally:
-                key_pending.unlink(missing_ok=True)
+            key_pending.write_text(value, encoding="utf-8")
+            if cfg.tunnel_key_file.exists():
+                key_backup = cfg.tunnel_key_file.with_name('.previous-' + uuid.uuid4().hex + '.key')
+                cfg.tunnel_key_file.replace(key_backup)
+            key_pending.replace(cfg.tunnel_key_file)
+            imported = True
         pending.replace(path)
-        return replace(cfg, path=path)
+    except BaseException:
+        if key_backup is not None and key_backup.exists():
+            key_backup.replace(cfg.tunnel_key_file)
+        elif imported:
+            cfg.tunnel_key_file.unlink(missing_ok=True)
+        raise
     finally:
-        pending.unlink(missing_ok=True)
+        if key_pending is not None:
+            key_pending.unlink(missing_ok=True)
+    if key_backup is not None:
+        try:
+            key_backup.unlink(missing_ok=True)
+        except OSError:
+            pass  # Both files are committed; a private backup can be removed later.
+    return replace(cfg, path=path)
 
 
 def doctor(path, *, assets_root=None):

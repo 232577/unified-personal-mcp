@@ -190,6 +190,10 @@ class SearchManager:
 
     def stop(self, owner, search_id):
         session = self._owned(owner, search_id)
+        self._stop(session)
+        return self.read(owner, search_id)
+
+    def _stop(self, session):
         with session.lock:
             if session.state == "running":
                 session.state = "stopped"
@@ -198,21 +202,28 @@ class SearchManager:
         if session.thread.is_alive():
             raise RuntimeError("SEARCH_CLEANUP_INCOMPLETE")
         session.job.close()
-        return self.read(owner, search_id)
 
     def release(self, owner, search_id):
+        return self._release(self._owned(owner, search_id))
+
+    def _release(self, session):
+        # Process termination and collector joins can be slow. Keep capacity
+        # reserved until they finish, without blocking another owner's reads.
+        self._stop(session)
         with self.lock:
-            self.stop(owner, search_id)
-            del self.sessions[search_id]
-        return {"search_id": search_id, "state": "released"}
+            if self.sessions.get(session.search_id) is session:
+                del self.sessions[session.search_id]
+        return {"search_id": session.search_id, "state": "released"}
 
     def end_owner(self, owner):
         with self.lock:
-            for sid in [s.search_id for s in self.sessions.values() if s.owner == owner]:
-                self.release(owner, sid)
+            sessions = [s for s in self.sessions.values() if s.owner == owner]
+        for session in sessions:
+            self._release(session)
 
     def close(self):
         with self.lock:
             self.closed = True
-            for owner in {s.owner for s in self.sessions.values()}:
-                self.end_owner(owner)
+            sessions = list(self.sessions.values())
+        for session in sessions:
+            self._release(session)

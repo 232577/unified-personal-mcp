@@ -116,6 +116,9 @@ class BrowserManager:
         if hybrid_profile is not None and self.hybrid_manager is None:
             raise RuntimeError('HYBRID_ADAPTER_DISABLED')
         with self.lock:
+            # Profile loading can overlap task cleanup. Reserve under the same
+            # lock used to fence and inventory sessions in end_task.
+            self._task(token)
             # Reserve and dispatch only once even for simultaneous starts.
             old = self.journal.get(task['task_key'], request_id)
             if old:
@@ -344,7 +347,7 @@ class BrowserManager:
 
     def end_task(self, token):
         # TaskStore calls hooks while the token is still active.
-        _, task = self.store.require(token)
+        _, task = self.store.require(token, allow_ending=True)
         with self.lock:
             self.ending.add(task['task_key'])
             sessions = [s for s in self.sessions.values() if s.owner == task['task_key']]

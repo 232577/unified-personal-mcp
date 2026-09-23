@@ -160,10 +160,18 @@ def service_process_status(saved, config):
         if float(saved.get("updated", 0)) < created - 2:
             return {"running": False}
         argv = process.cmdline()
-        if "serve" not in argv or "--config" not in argv:
+        if not {'serve', 'gui'}.intersection(argv):
             return {"running": False}
-        index = argv.index("--config")
-        if index + 1 >= len(argv) or not _same_path(argv[index + 1], config.path):
+        if '--config' in argv:
+            index = argv.index('--config')
+            if index + 1 >= len(argv):
+                return {'running': False}
+            config_path = argv[index + 1]
+        else:
+            from .__main__ import default_config_path
+            config_path = next((value.split('=', 1)[1] for value in argv
+                                if value.startswith('--config=')), default_config_path())
+        if not _same_path(config_path, config.path):
             return {"running": False}
         version = saved.get("version")
         if not isinstance(version, str) or not VERSION.fullmatch(version):
@@ -452,6 +460,7 @@ class AutostartManager:
                 receipt = self.scheduler.register(self.task_name, bundle, self.config.path)
                 installed = self.scheduler.status(self.task_name)
                 if (not installed.get("enabled") or not installed.get("managed")
+                        or not receipt or installed.get('xml') != receipt.get('xml')
                         or not _same_path(installed.get("bundle", ""), bundle)
                         or not _same_path(installed.get("config", ""), self.config.path)):
                     raise RuntimeError("AUTOSTART_REGISTRATION_MISMATCH")

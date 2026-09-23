@@ -165,6 +165,47 @@ def test_repeated_activation_renews_activity_and_configured_idle_grace(idle_regi
     assert registry.release_idle(owner, ref)["state"] == "ENDED"
 
 
+def test_reservation_expiring_during_other_workflow_cleanup_cannot_activate(idle_registry):
+    registry, owner, now, resources, config = idle_registry
+    (config.workspace_root / "other").mkdir()
+    registry.idle_timeout = 100
+    _, ref = active(registry, owner, project="other", request="other")
+    now[0] = 1099
+    token = registry.begin(owner, "app", "short-reservation", ttl=2)["workflow_id"]
+
+    def slow_cleanup():
+        now[0] = 1102
+        resources[ref[4:]].closed = True
+
+    resources[ref[4:]].close = slow_cleanup
+    now[0] = 1100
+    with pytest.raises(WorkflowError, match="WORKFLOW_INACTIVE"):
+        registry.activate(owner, token)
+    assert registry.status(owner, token)["state"] == "EXPIRED"
+    assert len(resources) == 1
+    assert registry.snapshot(owner)["workflows"] == {"ENDED": 1, "EXPIRED": 1}
+    assert registry.begin(owner, "app", "replacement")["ok"]
+
+
+def test_begin_expiring_reservation_after_cleanup_updates_usage_snapshot(idle_registry):
+    registry, owner, now, resources, config = idle_registry
+    (config.workspace_root / "other").mkdir()
+    registry.idle_timeout = 100
+    _, ref = active(registry, owner, project="other", request="other")
+    now[0] = 1099
+    expired = registry.begin(owner, "app", "short-reservation", ttl=2)["workflow_id"]
+
+    def slow_cleanup():
+        now[0] = 1102
+        resources[ref[4:]].closed = True
+
+    resources[ref[4:]].close = slow_cleanup
+    now[0] = 1100
+    assert registry.begin(owner, "app", "replacement")["ok"]
+    assert registry.status(owner, expired)["state"] == "EXPIRED"
+    assert registry.snapshot(owner)["workflows"] == {"ENDED": 1, "EXPIRED": 1, "RESERVED": 1}
+
+
 def test_activation_cannot_renew_through_an_idle_cleanup_probe(idle_registry):
     registry, owner, now, resources, _ = idle_registry
     token, ref = active(registry, owner)
