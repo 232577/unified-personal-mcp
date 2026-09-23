@@ -131,7 +131,7 @@ assert current_task() == previous_task
 - [x] Run full tests_personal/tests_bf and Ruff; run an independent fresh review of concurrency, credentials, supervisors and package installation. Fix consequential findings and rerun affected tests.
 - [x] Pin compatible MCP Inspector outside production package, run authenticated tools/list and representative calls against isolated HTTP service. Save result evidence, not credentials. Do not assume client extension support.
 - [x] Build clean 0.1.6 bundle with existing build_portable.py; verify manifests, ZIP, private-data exclusion and pythonw hidden-console behavior; run isolated packaged HTTP smoke and new-feature checks.
-- [ ] Publish authorized source updates to existing public repository and verify Windows CI. Retain old validated bundle for rollback.
+- [x] Publish authorized source updates to existing public repository and verify Windows CI. Retain old validated bundle for rollback. Public commit 1fb959b and run 35696182372 succeeded; rechecked 2026-09-23.
 - [x] Register verified 0.1.6 as next-login target without stopping current service. Report current versus pending version accurately. Defer actual tunnel/plugin-new-schema verification until authorized runtime switch; record this remaining acceptance item explicitly.
 
 ## Preflight and progress

@@ -69,6 +69,7 @@ def unified_catalog(bf_server, *, full_control=False, search_sessions=4):
         "workflow_id": WORKFLOW, "project": {"type": "string"}, "access": {"enum": ["read", "write"]},
         "workflow_ref": WORKFLOW_REF, "created": {"type": "number"},
         "credential_generation": {"type": "integer"}, "commands": {"type": "array"},
+        "job_processes": {"type": "object"},
         "last_activity": {"type": "number"}, "idle_seconds": {"type": "number"},
         "workflows": {"type": "array", "items": {"type": "object"}},
         "expires": {"type": "number"}, "instructions": {"type": "string"}, "error": {"type": "object"}}}
@@ -84,7 +85,11 @@ def unified_catalog(bf_server, *, full_control=False, search_sessions=4):
         "workflow after losing its token, list first then resume with workflow_ref, credential_generation "
         "as expected_generation and a unique request_id. This replaces the old credential without restarting "
         "owned commands. Never automatically resume another task on PROJECT_BUSY. Retry a lost resume reply "
-        "with exactly the same request_id and parameters. status lists retained command handles.",
+        "with exactly the same request_id and parameters. status lists retained command handles and "
+        "diagnostic-only owned Job PIDs. A command root may have exited while its descendants still run; "
+        "commands=0 does not mean idle. If the owner explicitly wants the entire workflow stopped, "
+        "resume the SAME workflow when needed, inspect status, then end it. Do not kill arbitrary PIDs "
+        "or restart the host to resolve one workflow. Unknown diagnostics do not prove idle.",
         {"action": {"enum": ["begin", "activate", "status", "end", "list", "release_idle", "resume"]},
          "workflow_id": WORKFLOW, "workflow_ref": WORKFLOW_REF,
          "expected_generation": {"type": "integer", "minimum": 0},

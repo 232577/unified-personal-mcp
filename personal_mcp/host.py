@@ -110,7 +110,8 @@ class UnifiedRuntime(Runtime):
                                        search_sessions=config.search_sessions)
         self.catalog_revision = catalog_revision(self.catalog)
         self.health_provider = None
-        self._usage_cache = {'commands': 0, 'retained_commands': 0, 'browser_sessions': 0,
+        self._usage_cache = {'commands': 0, 'retained_commands': 0, 'coding_job_active_processes': None,
+                             'browser_sessions': 0,
                              'webview2_instances': 0, 'search_sessions': 0}
         self.validators = {k: Draft202012Validator(v["inputSchema"]) for k, v in self.catalog.items()}
         self._exposed_tool_names = list(self.catalog)
@@ -177,6 +178,15 @@ class UnifiedRuntime(Runtime):
                 counters.update(commands=commands, retained_commands=retained)
             else:
                 stale = True
+            job_processes = 0
+            for resource in resources:
+                observed = resource.coding.job_process_snapshot()
+                if observed['status'] != 'available':
+                    stale = True
+                    break
+                job_processes += observed['active_process_count']
+            else:
+                counters['coding_job_active_processes'] = job_processes
             keys = {resource.key for resource in resources}
             task_keys = {self.bf_server._bf_store._task_key(resource.bf_token)
                          for resource in resources if resource.bf_token}
@@ -254,6 +264,7 @@ class UnifiedRuntime(Runtime):
                     if action == 'status' and result.get('state') == 'ACTIVE':
                         with self.registry.use(self.principal, args['workflow_id'], control=True, touch=False) as resource:
                             result['commands'] = resource.coding.command_inventory()
+                            result['job_processes'] = resource.coding.job_process_snapshot()
                 return tool_result(result)
             token = args.pop("workflow_id")
             write = name != "SearchSession" and not self.catalog[name]["annotations"].get("readOnlyHint", False)

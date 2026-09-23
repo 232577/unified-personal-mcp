@@ -72,8 +72,12 @@ try:
     token = recovered['workflow_id']
     assert call('OperationStatus', workflow_id=token, request_id='build-once')['result']['structuredContent'] == first
     info = call('server_info')
-    assert info['version'] == '0.1.6' and len(info['catalog_revision']) == 64
+    expected_version = json.loads((bundle / 'package-metadata.json').read_text(encoding='utf-8'))['version']
+    assert info['version'] == expected_version and len(info['catalog_revision']) == 64
     assert info['health']['bf']['status'] == 'healthy'
+    processes = call('UnifiedTask', action='status', workflow_id=token)['job_processes']
+    assert processes['status'] == 'available' and processes['active_process_count'] == 0
+    assert info['resource_usage']['coding_job_active_processes'] == 0
     (project / "note.txt").write_text("unified 中文 search", encoding="utf-8")
     search = call("SearchSession", workflow_id=token, action="start", pattern="unified")
     deadline = time.monotonic() + 5
@@ -131,7 +135,8 @@ try:
     assert not service.runtime.bf_server._bf_browser_manager.sessions
     report.update(status="PASS", version=info['version'], tools=service.status()["tools"],
                   command_exactly_once=True, search=True, browser=True, credential_resume=True,
-                  operation_status=True, catalog_revision=info['catalog_revision'])
+                  operation_status=True, job_process_diagnostics=True,
+                  catalog_revision=info['catalog_revision'])
 finally:
     service.stop()
     (output / "result.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

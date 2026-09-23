@@ -81,6 +81,38 @@ class CodingRuntime(Runtime):
                  'stdout_ref': f'command:{key}:stdout', 'stderr_ref': f'command:{key}:stderr'}
                 for key, command in commands.items()]
 
+    def job_process_snapshot(self):
+        """Observe job membership; these PID diagnostics never authorize termination."""
+        unknown = {'status': 'unavailable', 'active_process_count': None,
+                   'running_command_pids': None, 'descendant_pids': None,
+                   'descendants_after_command_exit': None, 'diagnostic_only': True,
+                   'error_code': 'JOB_PROCESS_STATE_BUSY'}
+        if not self.commands_lock.acquire(blocking=False):
+            return unknown
+        try:
+            # A spawned process is not a descendant merely because its command
+            # root has not yet been registered in the inventory.
+            if self.starting_commands:
+                return unknown
+            if not self.owned_job.lock.acquire(blocking=False):
+                return unknown
+            try:
+                active = set(self.owned_job.active_pids())
+                commands = {**self.output_commands, **self.commands}
+                roots = {command.process.pid for command in commands.values()
+                         if command.process.pid in active and command.process.poll() is None}
+                descendants = active - roots
+                return {'status': 'available', 'active_process_count': len(active),
+                        'running_command_pids': sorted(roots), 'descendant_pids': sorted(descendants),
+                        'descendants_after_command_exit': bool(descendants) and not roots,
+                        'diagnostic_only': True}
+            except Exception:
+                return {**unknown, 'error_code': 'JOB_PROCESS_STATE_UNAVAILABLE'}
+            finally:
+                self.owned_job.lock.release()
+        finally:
+            self.commands_lock.release()
+
     def _command_env(self, extra):
         env = super()._command_env(extra)
         if self.full_control:
