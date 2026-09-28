@@ -74,6 +74,10 @@ def build(destination, python_home, assets, *, zip_output=False):
     for name in ("personal_mcp", "bf_automation", "coding_tools_mcp"):
         shutil.copytree(ROOT / name, app / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     shutil.copy2(ROOT / "packaging/run.py", app / "run.py")
+    shutil.copy2(ROOT / "packaging/startup_diagnostics.py", app / "startup_diagnostics.py")
+    # A CMD fallback works even when the launcher or Python runtime cannot start.
+    diagnostic = (ROOT / "packaging/startup-diagnostics.cmd").read_text(encoding="utf-8")
+    (destination / "启动诊断.cmd").write_bytes(diagnostic.replace('\r\n', '\n').replace('\n', '\r\n').encode('utf-8'))
     for name in ("browsers", "bin", "tunnel-client"):
         shutil.copytree(assets / name, destination / "resources" / name,
                         ignore=shutil.ignore_patterns(".links"))

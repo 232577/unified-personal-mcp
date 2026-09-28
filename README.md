@@ -46,6 +46,8 @@ python -m venv .venv-host
 
 ## 客户端使用
 
+0.1.10 补齐启动失败提示：隐藏启动仍保持，内部 Python 非零退出会显示退出码和日志位置。遇到双击无窗口时运行包内“启动诊断.cmd”，检查完整解压、Windows 架构、Python/Tk 及界面导入；不读取运行 key 或启动隧道。诊断成功只代表这些本机检查通过，不替代另一台电脑的实际连接验收。
+
 1. UnifiedTask begin 指定工作区中的具体项目，保存仅返回一次的 workflow_id。
 2. UnifiedTask activate，然后在编码、桌面和浏览器工具中使用同一个 workflow_id。
 3. 每个写入操作使用唯一 request_id。结果为 unknown 时先观察，不自动重做。
