@@ -9,17 +9,23 @@ from dataclasses import replace
 from pathlib import Path
 
 from .config import load_config
-from .protection import InstanceLock, prepare_private_directory, read_tunnel_key
+from .protection import InstanceLock, prepare_private_directory, read_tunnel_key, validate_tunnel_key
 from .tunnel import assert_tunnel_available, verify_client
 
 
-def save_settings(path, raw, *, key_import=None):
+def save_settings(path, raw, *, key_import=None, key_value=None, create_only=False):
+    if key_import is not None and key_value is not None:
+        raise ValueError("KEY_SOURCE_CONFLICT")
+    if key_value is not None:
+        key_value = validate_tunnel_key(key_value, file_source=True)
     path = Path(path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     pending = path.parent / (".settings-" + uuid.uuid4().hex + ".local.json")
     with ExitStack() as guards:
         guards.callback(InstanceLock('settings:' + str(path)).close)
         try:
+            if create_only and path.exists():
+                raise ValueError("CONFIGURATION_ALREADY_EXISTS")
             pending.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
             cfg = load_config(pending)
             roots = {cfg.data_root}
@@ -30,19 +36,22 @@ def save_settings(path, raw, *, key_import=None):
                     pass  # A stopped installation can replace an invalid configuration.
             for root in sorted(roots):
                 guards.callback(InstanceLock('installation:' + str(root.resolve())).close)
-            return _save_validated(path, pending, cfg, key_import)
+            return _save_validated(path, pending, cfg, key_import, key_value, create_only)
         finally:
             pending.unlink(missing_ok=True)
 
 
-def _save_validated(path, pending, cfg, key_import):
+def _save_validated(path, pending, cfg, key_import, key_value, create_only):
     key_backup = key_pending = None
     imported = False
     try:
-        if key_import is not None:
+        if key_import is not None or key_value is not None:
             if cfg.tunnel_key_file is None:
                 raise ValueError("KEY_IMPORT_REQUIRES_FILE_SOURCE")
-            value = read_tunnel_key(replace(cfg, tunnel_key_file=Path(key_import).resolve(), tunnel_key_env=None))
+            value = (read_tunnel_key(replace(cfg, tunnel_key_file=Path(key_import).resolve(), tunnel_key_env=None))
+                     if key_import is not None else key_value)
+            if create_only and cfg.tunnel_key_file.exists():
+                raise ValueError("TUNNEL_KEY_ALREADY_EXISTS")
             prepare_private_directory(cfg.data_root)
             cfg.tunnel_key_file.parent.mkdir(parents=True, exist_ok=True)
             key_pending = cfg.tunnel_key_file.with_name(".import-" + uuid.uuid4().hex + ".key")
@@ -52,7 +61,13 @@ def _save_validated(path, pending, cfg, key_import):
                 cfg.tunnel_key_file.replace(key_backup)
             key_pending.replace(cfg.tunnel_key_file)
             imported = True
-        pending.replace(path)
+        if create_only:
+            try:
+                os.link(pending, path)
+            except FileExistsError:
+                raise ValueError("CONFIGURATION_ALREADY_EXISTS") from None
+        else:
+            pending.replace(path)
     except BaseException:
         if key_backup is not None and key_backup.exists():
             key_backup.replace(cfg.tunnel_key_file)

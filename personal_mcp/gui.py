@@ -388,5 +388,15 @@ class SetupWindow:
 
 def run(path, assets_root=None):
     root = tk.Tk()
-    SetupWindow(root, path, assets_root)
+    def show_setup(message=None):
+        for child in root.winfo_children():
+            child.destroy()
+        window = SetupWindow(root, path, assets_root)
+        if message:
+            window.show(message)
+    if Path(path).is_file():
+        show_setup()
+    else:
+        from .quick_setup import QuickSetupWindow
+        QuickSetupWindow(root, path, assets_root, on_complete=show_setup)
     root.mainloop()

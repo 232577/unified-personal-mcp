@@ -83,6 +83,7 @@ def build(destination, python_home, assets, *, zip_output=False):
     shutil.copytree(ROOT / "docs/personal", destination / "docs/personal")
     shutil.copytree(ROOT / "examples/personal", destination / "examples/personal")
     installation_files(destination)
+    shutil.copy2(ROOT / "docs/personal/换机使用说明.txt", destination / "使用前先看.txt")
     csc = Path(os.environ.get("SystemRoot", "C:/Windows")) / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
     run(csc, "/nologo", "/target:winexe", "/platform:x64", "/reference:System.Windows.Forms.dll",
         "/out:" + str(destination / "UnifiedPersonalMCP.exe"), ROOT / "packaging/Launcher.cs")

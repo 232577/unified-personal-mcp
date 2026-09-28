@@ -59,6 +59,22 @@ def _environment_value(name):
     raise ValueError("TUNNEL_KEY_UNAVAILABLE")
 
 
+def validate_tunnel_key(value, *, file_source=False):
+    """Normalize a key without ever including its contents in an error."""
+    if not isinstance(value, str):
+        raise ValueError("TUNNEL_KEY_INVALID")
+    value = value.strip()
+    if not 20 <= len(value) <= 16384 or any(c.isspace() or ord(c) < 32 for c in value):
+        raise ValueError("TUNNEL_KEY_INVALID")
+    if file_source:
+        try:
+            if len(value.encode("utf-8")) > 16384:
+                raise ValueError("TUNNEL_KEY_INVALID")
+        except UnicodeError:
+            raise ValueError("TUNNEL_KEY_INVALID") from None
+    return value
+
+
 def read_tunnel_key(config):
     try:
         if config.tunnel_key_env is not None:
@@ -69,9 +85,6 @@ def read_tunnel_key(config):
             if len(value) > 16384:
                 raise ValueError("TUNNEL_KEY_INVALID")
             value = value.decode("utf-8-sig")
-        value = value.strip()
-        if not 20 <= len(value) <= 16384 or any(c.isspace() or ord(c) < 32 for c in value):
-            raise ValueError("TUNNEL_KEY_INVALID")
-        return value
+        return validate_tunnel_key(value)
     except (OSError, UnicodeError, AttributeError):
         raise ValueError("TUNNEL_KEY_UNAVAILABLE") from None
