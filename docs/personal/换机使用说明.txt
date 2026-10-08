@@ -14,6 +14,7 @@ Unified Personal MCP · Windows x64 完整运行包
 本包包含 Python、Chromium、代码搜索工具、OpenAI 隧道客户端及本工具需要的 Python 依赖。工具本体无需另装 Python 或 Node.js。
 被开发项目需要的 Git、Node.js、编译器、数据库和项目依赖，仍按该项目需求安装。操作 WebView2 业务应用时，目标电脑需要 Microsoft Edge WebView2 Runtime；独立 Chromium 浏览器不依赖它。
 桌面操作需保持 Windows 用户已登录，界面可交互。此程序不是跨平台或开机未登录前的系统服务。
+0.1.11 会读取该设备已启用的显式系统 HTTP/HTTPS 代理，用于连接 OpenAI。本机 MCP 转发仍直连。更换代理后可在控制台点击“连接 OpenAI”重新读取；不下载或执行 PAC 自动配置脚本。
 
 四、本机配置与日志
 配置和运行 key 保存在 %LOCALAPPDATA%\UnifiedPersonalMCP，不会写回运行包。

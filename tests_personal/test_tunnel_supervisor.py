@@ -58,6 +58,23 @@ def supervisor(monkeypatch, runners, now=None):
         clock=(lambda: now[0]) if now is not None else time.time)
 
 
+def test_poll_failure_is_degraded_without_replacing_live_child(monkeypatch):
+    runner = FakeRunner()
+    runner.readiness_error = 'TUNNEL_POLL_FAILED'
+    monitor = supervisor(monkeypatch, [runner])
+    try:
+        monitor.start()
+        eventually(lambda: monitor.snapshot()['status'] == 'degraded')
+        assert monitor.snapshot()['error_code'] == 'TUNNEL_POLL_FAILED'
+        assert runner.alive and runner.starts == 1 and runner.closes == 0
+        runner.readiness_error = None
+        runner.available = True
+        eventually(lambda: monitor.snapshot()['status'] == 'healthy')
+        assert runner.starts == 1
+    finally:
+        monitor.close()
+
+
 def test_alive_unready_is_preserved_then_recovers_without_new_process(monkeypatch):
     runner = FakeRunner()
     monitor = supervisor(monkeypatch, [runner])

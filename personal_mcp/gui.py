@@ -22,6 +22,7 @@ ERRORS = {
     "TUNNEL_CLIENT_HASH_MISMATCH": "隧道程序与固定版本不一致，请重新安装完整程序包。",
     "TUNNEL_READY_TIMEOUT": "隧道尚未就绪，请检查网络和隧道配置后重试。",
     "TUNNEL_START_FAILED": "隧道启动失败，请检查私有数据目录中的隧道日志。",
+    "TUNNEL_POLL_FAILED": "OpenAI 连接中断，正在自动重试。请检查系统代理和网络。",
     "SERVICE_CLEANUP_INCOMPLETE": "部分资源尚未关闭，项目仍保持锁定。请再次点击停止服务。",
     "BACKEND_KEY_INVALID": "本地连接密钥损坏，请检查私有数据目录。",
     "PORTABLE_PACKAGE_REQUIRED": "请使用完整便携包中的程序来设置登录自启动。",

@@ -133,7 +133,8 @@ class TunnelSupervisor:
                 self._update(status='healthy', last_success=now, error_code=None, next_retry=None)
             else:
                 self._healthy_since = None
-                self._update(status='degraded', error_code='TUNNEL_NOT_READY', next_retry=None)
+                code = getattr(self._runner, 'readiness_error', None) or 'TUNNEL_NOT_READY'
+                self._update(status='degraded', error_code=code, next_retry=None)
         except Exception as exc:
             code = _error_code(exc)
             try:

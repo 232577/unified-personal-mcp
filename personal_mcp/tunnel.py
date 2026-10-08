@@ -1,8 +1,12 @@
 """Pinned OpenAI Secure MCP Tunnel runner with isolated child credentials."""
 
 import hashlib
+import ipaddress
 import os
+import re
 import subprocess
+import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,6 +17,7 @@ import yaml
 
 from bf_automation.runtime import application_environment
 from .protection import InstanceLock, prepare_private_directory, read_tunnel_key
+from .tunnel_diagnostics import latest_poller_state
 from .windows_jobs import OwnedJob
 
 CLIENT_VERSION = "0.0.14+0f870e50a973fa820d4c409000059e181e8d242b"
@@ -67,10 +72,69 @@ def assert_tunnel_available(tunnel_id, *, processes=None):
             raise RuntimeError("TUNNEL_OWNERSHIP_UNCERTAIN") from None
 
 
-def tunnel_profile(config):
+def _explicit_http_proxy(value):
+    if (not isinstance(value, str) or not value or any(c.isspace() for c in value)
+            or any(c in value for c in '\\?#')):
+        return None
+    if '=' in value:
+        entries = {}
+        for entry in value.split(';'):
+            name, separator, address = entry.partition('=')
+            name = name.casefold()
+            if not separator or name in entries:
+                return None
+            entries[name] = address
+        value = entries.get('https', entries.get('http', ''))
+    try:
+        parsed = urllib.parse.urlsplit(value if '://' in value else 'http://' + value)
+        if (parsed.scheme not in {'http', 'https'} or not parsed.hostname or not parsed.port
+                or parsed.username is not None or parsed.password is not None
+                or parsed.path or parsed.query or parsed.fragment):
+            return None
+        host = parsed.hostname
+        if ':' in host:
+            host = '[' + str(ipaddress.IPv6Address(host)) + ']'
+        elif len(host) > 253 or any(not re.fullmatch(
+                r'[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?', label)
+                for label in host.rstrip('.').split('.')):
+            return None
+        return f'{parsed.scheme}://{host}:{parsed.port}'
+    except ValueError:
+        return None
+
+
+def system_http_proxy():
+    """Read only the currently enabled, explicit WinInet HTTP proxy; never fetch PAC."""
+    if sys.platform != 'win32':
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                r'Software\Microsoft\Windows\CurrentVersion\Internet Settings') as key:
+            enabled, kind = winreg.QueryValueEx(key, 'ProxyEnable')
+            if kind != winreg.REG_DWORD or type(enabled) is not int or enabled != 1:
+                return None
+            value, kind = winreg.QueryValueEx(key, 'ProxyServer')
+            if kind != winreg.REG_SZ:
+                return None
+        return _explicit_http_proxy(value)
+    except (ImportError, OSError, ValueError, TypeError):
+        return None
+
+
+def _connection_digest(cloud_key, http_proxy):
+    # Length-prefix the key so changes in either setting cannot alias each other.
+    key = cloud_key.encode('utf-8')
+    return hashlib.sha256(len(key).to_bytes(8, 'big') + key + (http_proxy or '').encode('utf-8')).digest()
+
+
+def tunnel_profile(config, *, http_proxy=None):
+    control_plane = {"base_url": "https://api.openai.com", "tunnel_id": config.tunnel_id,
+                     "api_key": "env:UPM_TUNNEL_RUN_KEY"}
+    if http_proxy is not None:
+        control_plane['http_proxy'] = http_proxy
     return {"config_version": 1,
-        "control_plane": {"base_url": "https://api.openai.com", "tunnel_id": config.tunnel_id,
-                          "api_key": "env:UPM_TUNNEL_RUN_KEY"},
+        "control_plane": control_plane,
         "health": {"listen_addr": "127.0.0.1:0", "url_file": str(config.data_root / "tunnel-health.url")},
         "admin_ui": {"open_browser": False}, "log": {"level": "info", "format": "json"},
         "mcp": {"extra_headers": {"Authorization": "env:UPM_BACKEND_AUTHORIZATION"},
@@ -90,6 +154,9 @@ class TunnelRunner:
         self.config, self.binary, self.backend_key = config, binary, backend_key
         self.job = self.lock = self.process = None
         self._credential_digest = None
+        self._started_at = 0.0
+        self._polling_state = None
+        self.readiness_error = None
 
     def start(self):
         if self.process is not None:
@@ -99,14 +166,17 @@ class TunnelRunner:
         self.lock = InstanceLock("tunnel:" + self.config.tunnel_id)
         try:
             prepare_private_directory(self.config.data_root)
+            http_proxy = system_http_proxy()
             profile = self.config.data_root / "tunnel.local.yaml"
-            profile.write_text(yaml.safe_dump(tunnel_profile(self.config)), encoding="utf-8")
+            profile.write_text(yaml.safe_dump(tunnel_profile(self.config, http_proxy=http_proxy)), encoding="utf-8")
             health = self.config.data_root / "tunnel-health.url"
             health.unlink(missing_ok=True)
             cloud_key = read_tunnel_key(self.config)
             env = tunnel_environment(cloud_key, self.backend_key)
-            self._credential_digest = hashlib.sha256(cloud_key.encode('utf-8')).digest()
+            self._credential_digest = _connection_digest(cloud_key, http_proxy)
             self.job = OwnedJob()
+            self._started_at = time.time()
+            self._polling_state = None
             self.process = self.job.spawn([str(binary), "run", "--profile-file", str(profile),
                 "--mcp.extra-headers", "Authorization: env:UPM_BACKEND_AUTHORIZATION",
                 "--mcp.discovery-extra-headers", "Authorization: env:UPM_BACKEND_AUTHORIZATION",
@@ -125,9 +195,10 @@ class TunnelRunner:
 
     def credentials_changed(self):
         value = read_tunnel_key(self.config)
-        return hashlib.sha256(value.encode('utf-8')).digest() != self._credential_digest
+        return _connection_digest(value, system_http_proxy()) != self._credential_digest
 
     def ready(self):
+        self.readiness_error = None
         if not self.is_alive():
             return False
         try:
@@ -142,7 +213,16 @@ class TunnelRunner:
                 return False
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoHealthRedirect())
             with opener.open(url.rstrip("/") + "/readyz", timeout=1) as response:
-                return response.status == 200
+                if response.status != 200:
+                    return False
+            polling = latest_poller_state(self.config.data_root / 'tunnel.log', since=self._started_at)
+            if polling is not None and (self._polling_state is None
+                    or polling['observed_at'] >= self._polling_state['observed_at']):
+                self._polling_state = polling
+            if self._polling_state is not None and not self._polling_state['connected']:
+                self.readiness_error = 'TUNNEL_POLL_FAILED'
+                return False
+            return True
         except (OSError, ValueError, urllib.error.URLError):
             return False
 
