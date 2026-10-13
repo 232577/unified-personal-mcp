@@ -25,9 +25,9 @@ jobs:
       - name: Unit and HTTP checks
         run: |
           $env:PATH = (Join-Path $pwd 'resources/bin') + ';' + $env:PATH
-          python -m pytest -q tests_personal tests_bf --basetemp=verification/ci --junitxml=verification/results.xml
+          python -m pytest -q tests_personal tests_bf tests/test_runtime_boundary_regressions.py --basetemp=verification/ci --junitxml=verification/results.xml
       - name: Lint unified sources
-        run: python -m ruff check personal_mcp bf_automation tests_personal tests_bf
+        run: python -m ruff check personal_mcp bf_automation tests_personal tests_bf coding_tools_mcp/protocol.py coding_tools_mcp/server.py tests/test_runtime_boundary_regressions.py scripts/build_update.py scripts/prepare_update.py scripts/switch_managed_release.py
       - name: Upload verification report
         if: always()
         uses: actions/upload-artifact@v7.0.1

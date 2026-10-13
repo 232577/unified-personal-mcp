@@ -88,6 +88,55 @@ def test_full_control_filters_host_and_explicit_secret_environment(full_runtime,
     assert runtime.secret_env_filter_policy() == "enabled"
 
 
+def test_full_control_sensitive_env_query_matches_enforced_filter(full_runtime):
+    runtime, _, _ = full_runtime
+    request = {"tool_name": "exec_command", "permission": "sensitive_env",
+               "reason": "Inspect the configured environment policy",
+               "arguments": {"cmd": "echo fixture", "env": {"CUSTOM_TOKEN": "fixture-value"}}}
+    result = runtime.call_tool("request_permissions", request)
+    payload = result["structuredContent"]
+    assert result["isError"] is True
+    assert payload["status"] == "denied"
+    assert payload["grant_id"] is None
+    assert payload["error"]["code"] == "SENSITIVE_ENV_FILTER_ENABLED"
+    assert payload["constraints"]["secret_env_filter"] == "enabled"
+    assert "CUSTOM_TOKEN" not in runtime._command_env(request["arguments"]["env"])
+    assert "fixture-value" not in json.dumps(result)
+
+
+def test_full_control_grant_reports_existing_local_policy_and_no_approval(full_runtime):
+    runtime, _, _ = full_runtime
+    result = runtime.call_tool("request_permissions", {
+        "tool_name": "exec_command", "permission": "network",
+        "reason": "Inspect this installation's policy", "arguments": {"cmd": "echo fixture"}})
+    payload = result["structuredContent"]
+    assert result["isError"] is False
+    assert payload["status"] == "granted"
+    assert payload["constraints"]["mode"] == "full_control"
+    assert payload["constraints"]["existing_configuration"] is True
+    assert payload["constraints"]["user_approval"] is False
+    assert payload["constraints"]["platform_approval"] is False
+    assert payload["constraints"]["secret_env_filter"] == "enabled"
+    text = "\n".join(block["text"] for block in result["content"] if block["type"] == "text")
+    assert "existing local configuration" in text
+    assert "not user approval or platform approval" in text
+
+
+@pytest.mark.parametrize("mode", ["safe", "trusted"])
+def test_existing_modes_permission_query_remains_unsupported(tmp_path, mode):
+    cfg = replace(load_config(installation(tmp_path)), permission_mode=mode)
+    runtime = build_coding(cfg, cfg.project("app"))
+    try:
+        result = runtime.call_tool("request_permissions", {
+            "tool_name": "exec_command", "permission": "sensitive_env",
+            "reason": "Inspect this installation's policy", "arguments": {"cmd": "echo fixture"}})
+        assert result["isError"] is True
+        assert result["structuredContent"]["status"] == "unsupported"
+        assert result["structuredContent"]["error"]["code"] == "ELICITATION_UNSUPPORTED"
+    finally:
+        runtime.close()
+
+
 def test_full_control_preserves_explicit_shared_tool_environment(full_runtime, monkeypatch):
     runtime, _, external = full_runtime
     explicit = {name: str(external / name.lower()) for name in ("RUSTUP_HOME", "CARGO_HOME", "PIP_CACHE_DIR")}

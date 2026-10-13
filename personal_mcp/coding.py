@@ -56,9 +56,35 @@ class CodingRuntime(Runtime):
     def call_tool(self, *args, **kwargs):
         token = ACTIVE_JOB.set(self.owned_job)
         try:
-            return super().call_tool(*args, **kwargs)
+            result = super().call_tool(*args, **kwargs)
+            name = args[0] if args else kwargs.get("name")
+            if self.full_control and name == "request_permissions":
+                notice = result.get("structuredContent", {}).get("warnings", [])
+                if notice:
+                    result["content"].append({"type": "text", "text": "\n".join(notice)})
+            return result
         finally:
             ACTIVE_JOB.reset(token)
+
+    def request_permissions(self, args):
+        if not self.full_control:
+            return super().request_permissions(args)
+        # 查询已有配置不产生审批；full_control 仍保留敏感环境变量过滤。
+        constraints = {"mode": "full_control", "workspace": str(self.workspace.root),
+                       "secret_env_filter": "enabled", "existing_configuration": True,
+                       "user_approval": False, "platform_approval": False}
+        notice = ["This reports existing local configuration only, not user approval or platform approval. "
+                  "It does not change permissions or override platform safety."]
+        if args.get("permission") == "sensitive_env":
+            return {"ok": False, "status": "denied", "grant_id": None, "expires_at": None,
+                    "constraints": constraints, "warnings": notice,
+                    "error": {"code": "SENSITIVE_ENV_FILTER_ENABLED", "category": "permission",
+                              "retryable": False,
+                              "message": "This installation filters sensitive and loader/startup environment "
+                                         "variables, including explicitly supplied values. "
+                                         "A permission query does not disable that filter."}}
+        return {"ok": True, "status": "granted", "grant_id": "existing-full-control-policy",
+                "expires_at": None, "constraints": constraints, "warnings": notice}
 
     def exec_command(self, args):
         token = ACTIVE_JOB.set(self.owned_job)
@@ -80,6 +106,41 @@ class CodingRuntime(Runtime):
                  'started_at': command.started_at, 'completed_at': command.completed_at,
                  'stdout_ref': f'command:{key}:stdout', 'stderr_ref': f'command:{key}:stderr'}
                 for key, command in commands.items()]
+
+    def command_observation(self, command_id):
+        """Non-consuming observation; never submit input, terminate or evict.
+
+        An exited root does not prove its descendants stopped or its output was
+        verified. A busy/missing handle is unknown, never an inferred success.
+        """
+        def unavailable(code):
+            return {'ok': False, 'command_id': command_id, 'observation': 'unavailable',
+                    'status': 'unknown', 'exit_code': None, 'error': {'code': code}}
+
+        if not self.commands_lock.acquire(blocking=False):
+            return unavailable('COMMAND_STATUS_BUSY')
+        try:
+            command = self.commands.get(command_id) or self.output_commands.get(command_id)
+        finally:
+            self.commands_lock.release()
+        if command is None:
+            return unavailable('COMMAND_NOT_FOUND')
+        if not command.lock.acquire(blocking=False):
+            return unavailable('COMMAND_STATUS_BUSY')
+        try:
+            exit_code = command.process.poll()
+            return {'ok': True, 'command_id': command_id, 'observation': 'available',
+                    'status': 'running' if exit_code is None else 'exited',
+                    'exit_code': exit_code, 'started_at': command.started_at,
+                    'completed_at': command.completed_at,
+                    'output_complete': exit_code is not None and
+                        not any(thread.is_alive() for thread in command.reader_threads),
+                    'stdout_ref': f'command:{command_id}:stdout',
+                    'stderr_ref': f'command:{command_id}:stderr'}
+        except (OSError, ValueError):
+            return unavailable('COMMAND_STATUS_UNAVAILABLE')
+        finally:
+            command.lock.release()
 
     def job_process_snapshot(self):
         """Observe job membership; these PID diagnostics never authorize termination."""

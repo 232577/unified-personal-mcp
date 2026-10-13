@@ -333,6 +333,12 @@ class WorkflowRegistry:
         with self.lock:
             return self._public(self._row(owner, token))
 
+    def closed_operation_owners(self):
+        """Internal identities whose credentials can never dispatch tools again."""
+        with self.lock:
+            return tuple(key for key, row in self._metadata.items()
+                         if row['state'] in {'ENDED', 'EXPIRED'})
+
     def activate(self, owner, token):
         self.expire()
         with self.lock:

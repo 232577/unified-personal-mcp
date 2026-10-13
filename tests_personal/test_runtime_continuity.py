@@ -38,12 +38,13 @@ def test_operation_status_is_owner_scoped_and_coding_result_is_recoverable(host)
     assert call(host, 'OperationStatus', workflow_id=token, request_id='absent')['isError']
 
 
-def test_catalog_fingerprint_excludes_descriptions_but_detects_schema_change(host):
+def test_catalog_fingerprint_detects_description_and_schema_changes(host):
     before = catalog_revision(host.catalog)
     host.catalog['server_info']['description'] += ' reworded'
-    assert catalog_revision(host.catalog) == before
+    after_description = catalog_revision(host.catalog)
+    assert after_description != before
     host.catalog['server_info']['inputSchema']['properties']['new_field'] = {'type': 'string'}
-    assert catalog_revision(host.catalog) != before
+    assert catalog_revision(host.catalog) != after_description
 
 
 def test_workflow_status_inventory_does_not_renew_idle_lease(host):

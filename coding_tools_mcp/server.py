@@ -198,6 +198,9 @@ MAX_ACTIVE_COMMANDS = 16
 MAX_RETAINED_OUTPUT_COMMANDS = 32
 COMPLETED_COMMAND_TTL_SECONDS = 300
 MAX_RUNTIME_OUTPUT_BYTES = 16 * 1024 * 1024
+SUBMODULE_WORKTREE_WARNING = (
+    "Submodule working-tree changes are not inspected; submodule revision changes remain visible."
+)
 _COMMAND_RECOVERY_HINT = (
     "This command_id has expired or never existed; a finished command keeps its"
     f" output for {COMPLETED_COMMAND_TTL_SECONDS} seconds and only the last"
@@ -1191,8 +1194,8 @@ class Workspace:
         try:
             completed = subprocess.run(
                 [git, "-C", str(self.root), "check-ignore", "--stdin", "-z"],
-                input="\0".join(rel_paths) + "\0",
-                text=True,
+                input=b"\0".join(os.fsencode(path) for path in rel_paths) + b"\0",
+                text=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 timeout=2,
@@ -1201,7 +1204,7 @@ class Workspace:
             return set()
         if completed.returncode not in {0, 1}:
             return set()
-        return {path for path in completed.stdout.split("\0") if path}
+        return {os.fsdecode(path) for path in completed.stdout.split(b"\0") if path}
 
 
 class WorkspaceCommandManager:
@@ -1753,6 +1756,8 @@ class Runtime:
         selected_bytes = 0
         total_lines = 0
         selection_complete = False
+        truncated_by = None
+        first_line_exceeds_limit = False
         try:
             with resolved.path.open("r", encoding="utf-8", errors="strict", newline="") as handle:
                 for total_lines, line in enumerate(handle, start=1):
@@ -1762,27 +1767,36 @@ class Runtime:
                         continue
                     if selection_complete:
                         continue
-                    selected_parts.append(line)
-                    selected_bytes += len(line.encode("utf-8"))
-                    if len(selected_parts) > DEFAULT_MAX_LINES or selected_bytes > max_bytes:
+                    line_bytes = len(line.encode("utf-8"))
+                    if len(selected_parts) >= DEFAULT_MAX_LINES:
+                        truncated_by = "lines"
                         selection_complete = True
+                    elif selected_bytes + line_bytes > max_bytes:
+                        truncated_by = "bytes"
+                        selection_complete = True
+                        if not selected_parts:
+                            # 首行过长时保留预览，其余页只在物理行边界截断。
+                            preview = truncate_text_head(line, max_bytes=max_bytes)
+                            selected_parts.append(preview.content)
+                            first_line_exceeds_limit = True
+                    else:
+                        selected_parts.append(line)
+                        selected_bytes += line_bytes
         except UnicodeDecodeError as exc:
             raise ToolFailure("UNSUPPORTED_ENCODING", "File is not valid utf-8.", category="validation") from exc
         selected = "".join(selected_parts)
-        truncation = truncate_text_head(selected, max_lines=DEFAULT_MAX_LINES, max_bytes=max_bytes)
-        selected = truncation.content
-        truncated = truncation.truncated or selection_complete
+        truncated = selection_complete
         end = requested_end if requested_end is not None else total_lines
         if end < start_line:
             selected = ""
         actual_end = min(end, total_lines)
-        if truncated and truncation.output_lines > 0:
-            actual_end = min(total_lines, start_line + truncation.output_lines - 1)
-        next_start_line = actual_end + 1 if truncated and actual_end < total_lines else None
+        if truncated and selected_parts:
+            actual_end = min(total_lines, start_line + len(selected_parts) - 1)
+        next_start_line = actual_end + 1 if truncated and actual_end < min(end, total_lines) else None
         warnings = []
         if truncated:
             warnings.append("content truncated")
-        if truncation.first_line_exceeds_limit:
+        if first_line_exceeds_limit:
             warnings.append("first selected line exceeds max_bytes")
         result = {
             "path": resolved.display,
@@ -1795,21 +1809,20 @@ class Runtime:
             "total_bytes": total_bytes,
             "bytes_read": len(selected.encode("utf-8")),
             "truncated": truncated,
-            "truncated_by": truncation.truncated_by or ("bytes" if selection_complete else None),
-            "first_line_exceeds_limit": truncation.first_line_exceeds_limit,
-            "output_lines": truncation.output_lines,
-            "output_bytes": truncation.output_bytes,
+            "truncated_by": truncated_by,
+            "first_line_exceeds_limit": first_line_exceeds_limit,
+            "output_lines": len(selected_parts),
+            "output_bytes": len(selected.encode("utf-8")),
             "next_start_line": next_start_line,
             "warnings": warnings,
         }
         if next_start_line is not None:
+            continuation = {"path": requested_path, "start_line": next_start_line, "max_bytes": max_bytes}
+            if requested_end is not None:
+                continuation["end_line"] = requested_end
             result["next_action"] = {
                 "tool": "read_file",
-                "arguments": {
-                    "path": requested_path,
-                    "start_line": next_start_line,
-                    "max_bytes": max_bytes,
-                },
+                "arguments": continuation,
             }
         return result
 
@@ -2144,6 +2157,7 @@ class Runtime:
                 args,
                 cwd=str(self.workspace.root),
                 text=True,
+                encoding="utf-8",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
@@ -2477,8 +2491,8 @@ class Runtime:
                 return finish()
             with command.lock:
                 tty_has_initial_output = bool(
-                    len(command.stdout) > command.stdout_cursor
-                    or len(command.stderr) > command.stderr_cursor
+                    command.stdout_total_bytes > command.stdout_cursor
+                    or command.stderr_total_bytes > command.stderr_cursor
                 )
             if now - start >= initial_wait or (tty and tty_has_initial_output):
                 return finish()
@@ -2661,25 +2675,58 @@ class Runtime:
     def _run_git_text(
         self, cmd: list[str], *, timeout: int | None = None, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            cmd,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        # 在调用线程解码，避免 Windows 管道线程解码失败后丢失输出。
+        completed = self._run_git_bytes(
+            [cmd[0], "-c", "i18n.logOutputEncoding=UTF-8", *cmd[1:]],
             timeout=timeout,
-            env=self._git_env() if env is None else env,
+            env=env,
+        )
+        try:
+            stdout = completed.stdout.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+            stderr = completed.stderr.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        except UnicodeDecodeError as exc:
+            raise ToolFailure(
+                "GIT_ERROR",
+                "Git output is not valid UTF-8; refusing to replace undecodable bytes.",
+                category="runtime",
+            ) from exc
+        return subprocess.CompletedProcess(
+            completed.args, completed.returncode, stdout, stderr
         )
 
     def _run_git_bytes(
         self, cmd: list[str], *, timeout: int | None = None, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[bytes]:
+        git_env = self._git_env() if env is None else env
+        # Git 的只读查询也可能执行仓库配置的 fsmonitor 和内容过滤器。
+        # 只覆盖本次进程，不修改仓库或用户配置。
+        config_cmd = [cmd[0], "-c", "core.fsmonitor=false", "-C", str(self.workspace.root)]
+        if "-C" in cmd:
+            directory_index = cmd.index("-C") + 1
+            config_cmd[-1] = cmd[directory_index]
+        configured = subprocess.run(
+            [*config_cmd, "config", "--null", "--name-only", "--get-regexp", r"^filter\..*\.(clean|smudge|process|required)$"],
+            text=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            env=git_env,
+        )
+        if configured.returncode not in {0, 1}:
+            raise ToolFailure("GIT_ERROR", "Unable to inspect Git content filters safely.", category="runtime")
+        overrides = ["-c", "core.fsmonitor=false", "-c", "status.submoduleSummary=false", "-c", "diff.submodule=short"]
+        for raw_key in configured.stdout.split(b"\0"):
+            if raw_key:
+                key = os.fsdecode(raw_key)
+                value = "false" if key.endswith(".required") else ""
+                overrides.extend(["-c", f"{key}={value}"])
         return subprocess.run(
-            cmd,
+            [cmd[0], *overrides, *cmd[1:]],
             text=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,
-            env=self._git_env() if env is None else env,
+            env=git_env,
         )
 
     def _git_status_not_repo(self, completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
@@ -3009,7 +3056,7 @@ class Runtime:
         while time.time() < wait_until and command.process.poll() is None:
             time.sleep(0.02)
             with command.lock:
-                has_new_output = len(command.stdout) > command.stdout_cursor or len(command.stderr) > command.stderr_cursor
+                has_new_output = command.stdout_total_bytes > command.stdout_cursor or command.stderr_total_bytes > command.stderr_cursor
                 if has_new_output and not chars:
                     break
                 if has_new_output and chars:
@@ -3095,7 +3142,7 @@ class Runtime:
         )
         if root_check.returncode != 0:
             return self._git_status_not_repo(root_check)
-        status_cmd = [git, "-C", str(resolved.path), "status", "--porcelain=v1", "-b"]
+        status_cmd = [git, "-C", str(resolved.path), "status", "--porcelain=v1", "-b", "--ignore-submodules=dirty"]
         if not include_untracked:
             status_cmd.append("--untracked-files=no")
         completed = self._run_git_text(status_cmd, timeout=10, env=git_env)
@@ -3137,6 +3184,7 @@ class Runtime:
             "clean": not entries,
             "entries": entries,
             "truncated": len(entries) >= max_entries and len(lines) > max_entries + 1,
+            "warnings": [SUBMODULE_WORKTREE_WARNING] if (Path(root_check.stdout.strip()) / ".gitmodules").is_file() else [],
         }
 
     def git_diff(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -3166,13 +3214,14 @@ class Runtime:
             "diff": diff_text,
             "files": parse_diff_files(diff_text),
             **truncation_fields(diff_truncation),
-            "warnings": ["diff truncated"] if truncated else [],
+            "warnings": (["diff truncated"] if truncated else [])
+            + ([SUBMODULE_WORKTREE_WARNING] if (self.workspace.root / ".gitmodules").is_file() else []),
         }
 
     def _run_git_diff(
         self, git: str, context: int, path_filters: list[str], *, cached: bool, env: dict[str, str] | None = None
     ) -> bytes:
-        cmd = [git, "-C", str(self.workspace.root), "diff", f"--unified={context}"]
+        cmd = [git, "-C", str(self.workspace.root), "diff", "--no-ext-diff", "--no-textconv", "--submodule=short", "--ignore-submodules=dirty", f"--unified={context}"]
         if cached:
             cmd.append("--cached")
         if path_filters:
@@ -3303,6 +3352,8 @@ class Runtime:
             str(self.workspace.root),
             "show",
             "--no-ext-diff",
+            "--no-textconv",
+            "--submodule=short",
             "--format=fuller",
             f"--unified={context}",
         ]
@@ -3354,6 +3405,7 @@ class Runtime:
             "-C",
             str(self.workspace.root),
             "blame",
+            "--no-textconv",
             "--line-porcelain",
             "-L",
             f"{start_line},{final_line}",

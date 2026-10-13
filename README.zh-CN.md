@@ -1,4 +1,6 @@
-# Coding Tools MCP
+# 上游 Coding Tools MCP 历史说明
+
+本文件保留集成前的上游说明。当前项目是 **Unified Personal MCP**，版本、58 工具接口、Windows 安装和升级方法请以 [项目主页 README](README.md) 为准。下文的上游包名、工具数、遥测和发布方式不代表本项目。
 
 [English](README.md) | **简体中文**
 

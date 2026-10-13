@@ -75,25 +75,43 @@ def main():
         report['server_version'] = initialize['serverInfo']['version']
         invoke('initialize', auth=False, expected_exit=3)
         tools = invoke('tools/list')['tools']
-        assert len(tools) == 50 and 'OperationStatus' in {tool['name'] for tool in tools}
+        assert len(tools) == 58
+        assert {'workflow_begin', 'workflow_activate', 'workflow_resume', 'workflow_end',
+                'workflow_release_idle'} <= {tool['name'] for tool in tools}
+        assert {'OperationStatus', 'workflow_list', 'workflow_status', 'command_status'} <= {tool['name'] for tool in tools}
+        assert invoke('tools/call', 'workflow_list')['structuredContent']['workflows'] == []
         info = invoke('tools/call', 'server_info')['structuredContent']
         assert info['health']['bf']['status'] == 'healthy'
-        begun = invoke('tools/call', 'UnifiedTask', {'action': 'begin', 'project_path': 'fixture',
+        begun = invoke('tools/call', 'workflow_begin', {'project_path': 'fixture',
                                                   'request_id': 'begin'})['structuredContent']
         token = begun['workflow_id']
-        active = invoke('tools/call', 'UnifiedTask', {'action': 'activate', 'workflow_id': token})['structuredContent']
+        active = invoke('tools/call', 'workflow_activate', {'workflow_id': token})['structuredContent']
+        idle_refused = invoke('tools/call', 'workflow_release_idle',
+            {'workflow_ref': active['workflow_ref']}, expected_exit=5)['structuredContent']
+        assert idle_refused['error']['code'] == 'WORKFLOW_NOT_IDLE'
+        queried = invoke('tools/call', 'workflow_status', {'workflow_id': token})['structuredContent']
+        assert queried['state'] == 'ACTIVE'
+        assert queried['last_activity'] == active['last_activity']
         executed = invoke('tools/call', 'exec_command', {'workflow_id': token, 'request_id': 'execute',
             'cmd': 'echo inspector-fixture', 'yield_time_ms': 1000})
         assert executed['structuredContent']['exit_code'] == 0
+        observed = invoke('tools/call', 'command_status', {
+            'workflow_id': token, 'command_id': executed['structuredContent']['command_id']})['structuredContent']
+        assert observed['observation'] == 'available' and observed['exit_code'] == 0
+        rejected_input = invoke('tools/call', 'read_file', {'unexpected_field': True}, expected_exit=5)
+        assert rejected_input['structuredContent']['error']['code'] == 'INVALID_ARGUMENT'
+        after_rejection = invoke('tools/call', 'command_status', {
+            'workflow_id': token, 'command_id': executed['structuredContent']['command_id']})['structuredContent']
+        assert after_rejection['exit_code'] == 0
         outcome = invoke('tools/call', 'OperationStatus', {'workflow_id': token, 'request_id': 'execute'})
         assert outcome['structuredContent']['result'] == executed
-        resume_args = {'action': 'resume', 'workflow_ref': active['workflow_ref'],
+        resume_args = {'workflow_ref': active['workflow_ref'],
                        'request_id': 'resume', 'expected_generation': active['credential_generation']}
-        resumed = invoke('tools/call', 'UnifiedTask', resume_args)['structuredContent']
-        assert invoke('tools/call', 'UnifiedTask', resume_args)['structuredContent'] == resumed
+        resumed = invoke('tools/call', 'workflow_resume', resume_args)['structuredContent']
+        assert invoke('tools/call', 'UnifiedTask', {'action': 'resume', **resume_args})['structuredContent'] == resumed
         rejected = invoke('tools/call', 'UnifiedTask', {'action': 'status', 'workflow_id': token}, expected_exit=5)
         assert rejected['structuredContent']['error']['code'] == 'WORKFLOW_CREDENTIAL_REPLACED'
-        ended = invoke('tools/call', 'UnifiedTask', {'action': 'end',
+        ended = invoke('tools/call', 'workflow_end', {
             'workflow_id': resumed['workflow_id']})['structuredContent']
         assert ended['state'] == 'ENDED'
         report.update(status='PASS', tools=len(tools), catalog_revision=info['catalog_revision'])

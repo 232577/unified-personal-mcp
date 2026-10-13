@@ -38,6 +38,7 @@ def installation_files(destination):
     scripts = destination / "scripts"
     scripts.mkdir(exist_ok=True)
     shutil.copy2(ROOT / "scripts/install-autostart.ps1", scripts / "install-autostart.ps1")
+    shutil.copy2(ROOT / "scripts/switch_managed_release.py", scripts / "switch_managed_release.py")
     (destination / "package-metadata.json").write_text(json.dumps(
         {"name": "unified-personal-mcp", "version": version}, indent=2), encoding="utf-8")
 

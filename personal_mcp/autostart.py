@@ -213,7 +213,15 @@ def _com_operation(function):
     def operation(*args, **kwargs):
         import pythoncom
 
-        pythoncom.CoInitialize()
+        initialized = False
+        try:
+            pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+            initialized = True
+        except pythoncom.error as exc:
+            if exc.hresult != -2147417850:  # RPC_E_CHANGED_MODE
+                raise
+            # The thread already has a different apartment. CoInitialize hides
+            # this error; it does NOT acquire a reference we may uninitialize.
         failure = None
         try:
             result = function(*args, **kwargs)
@@ -221,11 +229,21 @@ def _com_operation(function):
             # Do not retain a traceback whose operation frame still owns COM proxies.
             failure = RuntimeError(str(exc))
         finally:
-            pythoncom.CoUninitialize()
+            if initialized:
+                pythoncom.CoUninitialize()
         if failure is not None:
             raise failure
         return result
     return operation
+
+
+def task_not_found(error):
+    """Decode IDispatch's nested HRESULT without hiding account/access errors."""
+    code = getattr(error, 'hresult', None)
+    if type(code) is int and code & 0xFFFFFFFF == 0x80020009:  # DISP_E_EXCEPTION
+        details = getattr(error, 'excepinfo', None)
+        code = details[5] if isinstance(details, (tuple, list)) and len(details) > 5 else None
+    return type(code) is int and code & 0xFFFFFFFF == 0x80070002
 
 
 class WindowsTaskScheduler:
@@ -269,7 +287,7 @@ class WindowsTaskScheduler:
             try:
                 task = folder.GetTask(name)
             except pywintypes.com_error as exc:
-                if exc.hresult in {-2147024894, -2147216625}:
+                if task_not_found(exc):
                     return {"exists": False, "enabled": False, "xml": None}
                 raise RuntimeError("AUTOSTART_STATUS_UNAVAILABLE") from exc
             definition = task.Definition
@@ -312,17 +330,25 @@ class WindowsTaskScheduler:
             return {"xml": str(registered.Xml)}
 
     @_com_operation
-    def restore(self, name, previous):
+    def restore(self, name, previous, *, expected_xml):
         import pywintypes
 
         with self._folder() as (_, folder):
+            try:
+                current = folder.GetTask(name)
+            except pywintypes.com_error as exc:
+                if task_not_found(exc):
+                    raise RuntimeError('CONCURRENT_TASK_CHANGE') from None
+                raise
+            if str(current.Xml) != expected_xml:
+                raise RuntimeError('CONCURRENT_TASK_CHANGE')
             if previous.get("exists"):
                 folder.RegisterTask(name, previous["xml"], 6, self._sid(), None, 3)
             else:
                 try:
                     folder.DeleteTask(name, 0)
                 except pywintypes.com_error as exc:
-                    if exc.hresult not in {-2147024894, -2147216625}:
+                    if not task_not_found(exc):
                         raise
 
     @_com_operation
@@ -464,6 +490,7 @@ class AutostartManager:
                         or not _same_path(installed.get("bundle", ""), bundle)
                         or not _same_path(installed.get("config", ""), self.config.path)):
                     raise RuntimeError("AUTOSTART_REGISTRATION_MISMATCH")
+                result = self.status()
             except Exception as exc:
                 # A failed write or later status read can be ambiguous. Do not
                 # replace another editor's update with our older backup.
@@ -479,12 +506,12 @@ class AutostartManager:
                         or not _same_path(latest.get('config', ''), self.config.path)):
                     raise RuntimeError('AUTOSTART_UPDATE_CONFLICT') from None
                 try:
-                    self.scheduler.restore(self.task_name, previous)
+                    self.scheduler.restore(self.task_name, previous, expected_xml=receipt['xml'])
                 except Exception as restore_error:
                     raise RuntimeError("AUTOSTART_ROLLBACK_FAILED") from restore_error
                 raise RuntimeError("AUTOSTART_UPDATE_FAILED") from exc
-            result = self.status()
-            return {**result, "backup": str(backup), "validated_version": expected_version, "started_now": False}
+            return {**result, "backup": str(backup), "validated_version": expected_version,
+                    "started_now": False, "registered_task": installed}
         finally:
             guard.close()
 

@@ -1,5 +1,26 @@
 # Security Policy
 
+## Unified Personal MCP deployment
+
+The supported Windows product is `personal_mcp`, which wraps the coding runtime
+described below. It binds only to IPv4 loopback, authenticates the local backend,
+and connects outward through the owner's configured OpenAI tunnel. Each workflow
+requires its current credential and owns its commands, browser resources and
+operation receipts. Ended workflows cannot be reactivated. All authenticated
+clients of one installation still belong to the same owner trust domain.
+
+The owner-selected `full_control` mode permits absolute paths and access outside
+the selected project as the current Windows user. It is not an OS sandbox and
+does not grant platform approval. Sensitive and loader environment variables
+remain filtered. `request_permissions` reports existing local policy; it neither
+opens an approval dialog nor changes policy. Read-only Git tools disable executable
+repository helpers instead of treating their read-only annotation as enforcement.
+
+The remaining sections document the underlying upstream coding runtime and its
+standalone modes; the wrapper's explicit full-control behavior takes precedence
+for this product. Private settings, keys, workflow databases and browser profiles
+must never be included in public source updates.
+
 This project exposes local coding-runtime primitives over MCP. The intended boundary is one configured workspace root plus server-side policy, best-effort Linux Landlock filesystem confinement for `exec_command` when available, and external deployment sandboxing.
 
 ## Current Implementation Caution

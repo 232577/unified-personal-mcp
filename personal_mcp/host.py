@@ -1,6 +1,7 @@
 """Single authenticated HTTP host for coding and in-process BF automation."""
 
 import json
+import time
 from copy import deepcopy
 from pathlib import Path
 
@@ -13,9 +14,11 @@ from . import __version__
 from .bf.executor import BFExecutor
 from .catalog import catalog_revision, unified_catalog
 from .coding import LocalTelemetry, build_coding
+from .diagnostics import CallDiagnostics, elapsed_ms, result_metadata, trace_scope
 from .full_control import FullControlProjectContext
 from .operations import OperationJournal
 from .search import SearchManager
+from .tool_policy import WORKFLOW_ACTIONS, requires_workflow_write
 from .workflows import AuthPrincipal, WorkflowError, WorkflowRegistry
 
 
@@ -96,6 +99,9 @@ class UnifiedRuntime(Runtime):
         if not isinstance(auth_token, str) or len(auth_token) < 32:
             raise ValueError("a private backend bearer key of at least 32 characters is required")
         self.config, self.bf_server = config, bf_server
+        # Validate the published contract before creating runtime resources.
+        catalog = unified_catalog(bf_server, full_control=config.full_control,
+                                  search_sessions=config.search_sessions)
         self.principal = AuthPrincipal("local-owner")
         context = ProjectContext((LoadedContextFile("Unified workflow",
             "Begin UnifiedTask for a concrete project, keep the one-time workflow_id and activate it. "
@@ -106,9 +112,10 @@ class UnifiedRuntime(Runtime):
         super().__init__(config.workspace_root, auth_token=auth_token, permission_mode=config.runtime_permission_mode,
                          project_context=context, transport="http")
         self.telemetry = LocalTelemetry()
-        self.catalog = unified_catalog(bf_server, full_control=config.full_control,
-                                       search_sessions=config.search_sessions)
+        self.catalog = catalog
         self.catalog_revision = catalog_revision(self.catalog)
+        self.diagnostics = CallDiagnostics(config.data_root, self.catalog,
+                                           self.catalog_revision, __version__)
         self.health_provider = None
         self._usage_cache = {'commands': 0, 'retained_commands': 0, 'coding_job_active_processes': None,
                              'browser_sessions': 0,
@@ -123,6 +130,7 @@ class UnifiedRuntime(Runtime):
             self.registry = WorkflowRegistry(config, lambda row: WorkflowResources(self, row),
                 recovery=lambda row: self.bf_server._bf_store.recover_context(row["token_hash"]))
             self.recovery_status = self.registry.recover()
+            self.operations.closed_owners = self.registry.closed_operation_owners
         except BaseException:
             self.bf.close()
             self.searches.close()
@@ -213,6 +221,21 @@ class UnifiedRuntime(Runtime):
                 'operation_results': self.operations.result_policy()}
 
     def call_tool(self, name, arguments, *, context=None):
+        with trace_scope() as trace_id:
+            started = time.monotonic()
+            action = arguments.get('action') if isinstance(arguments, dict) else None
+            self.diagnostics.emit('tool_received', trace_id, tool=name, action=action)
+            try:
+                result = self._call_tool(name, arguments, context=context)
+            except BaseException:
+                self.diagnostics.emit('tool_raised', trace_id, tool=name,
+                                      action=action, outcome='unknown', duration_ms=elapsed_ms(started))
+                raise
+            self.diagnostics.emit('tool_returned', trace_id, tool=name, action=action,
+                                  duration_ms=elapsed_ms(started), **result_metadata(result))
+            return result
+
+    def _call_tool(self, name, arguments, *, context=None):
         if name not in self.catalog:
             raise JsonRpcError(-32602, "Unknown tool")
         journaled = False
@@ -226,6 +249,9 @@ class UnifiedRuntime(Runtime):
 
         try:
             self.validators[name].validate(arguments)
+            with trace_scope() as trace_id:
+                self.diagnostics.emit('tool_validated', trace_id, tool=name,
+                                      action=arguments.get('action'))
             args = dict(arguments)
             if name == "server_info":
                 info = self.server_info_payload()
@@ -239,6 +265,8 @@ class UnifiedRuntime(Runtime):
                     "filesystem_scope": "current_windows_user" if self.config.full_control else "workflow_project",
                     "absolute_paths_allowed": self.config.full_control,
                     "health": self.health_snapshot(), "catalog_revision": self.catalog_revision,
+                    "catalog_revision_format": "complete-descriptors-v2",
+                    "diagnostics": self.diagnostics.snapshot(),
                     "resource_usage": self.resource_usage(),
                     "concurrency": {"project_limit": None, "commands_per_workflow": 16,
                         "browser_sessions": browser.max_sessions if browser else 0,
@@ -247,34 +275,29 @@ class UnifiedRuntime(Runtime):
                         "search_sessions_per_workflow": self.searches.max_per_owner,
                         "foreground_input": 1, "workflow_idle_seconds": self.config.workflow_idle_seconds},
                     "working_directory": "Set exec_command.workdir per call; other workflows are unchanged."})
+            if name == 'workflow_list':
+                return tool_result(self.registry.list(self.principal))
+            if name == 'workflow_status':
+                return tool_result(self._workflow_status(args['workflow_id']))
+            if name == 'command_status':
+                with self.registry.use(self.principal, args['workflow_id'],
+                                       control=True, touch=False) as resource:
+                    return tool_result(resource.coding.command_observation(args['command_id']))
+            if name in WORKFLOW_ACTIONS:
+                return tool_result(self._workflow_action(WORKFLOW_ACTIONS[name], args))
             if name == "UnifiedTask":
-                action = args.pop("action")
-                if action == "begin":
-                    result = self.registry.begin(self.principal, args["project_path"], args["request_id"],
-                                                 args.get("access", "write"), args.get("ttl", 120))
-                elif action == "list":
-                    result = self.registry.list(self.principal)
-                elif action == "release_idle":
-                    result = self.registry.release_idle(self.principal, args["workflow_ref"])
-                elif action == 'resume':
-                    result = self.registry.resume(self.principal, args['workflow_ref'],
-                                                  args['request_id'], args['expected_generation'])
-                else:
-                    result = getattr(self.registry, action)(self.principal, args["workflow_id"])
-                    if action == 'status' and result.get('state') == 'ACTIVE':
-                        with self.registry.use(self.principal, args['workflow_id'], control=True, touch=False) as resource:
-                            result['commands'] = resource.coding.command_inventory()
-                            result['job_processes'] = resource.coding.job_process_snapshot()
-                return tool_result(result)
+                return tool_result(self._workflow_action(args.pop('action'), args))
             token = args.pop("workflow_id")
-            write = name != "SearchSession" and not self.catalog[name]["annotations"].get("readOnlyHint", False)
+            write = requires_workflow_write(name)
             control = (name in {'OperationStatus', 'kill_command', 'read_output'}
                        or (name == 'write_stdin' and not args.get('chars', '')))
             with self.registry.use(self.principal, token, write=write, control=control) as resource:
-                if write and not control:
-                    # The client wait may have ended while native work remains.
-                    # Check only after obtaining the workflow's write gate and
-                    # before journaling or dispatching any additional mutation.
+                def before_dispatch():
+                    if not write or control:
+                        return
+                    # Unknown/pending native effects still fence new mutations.
+                    # For journaled tools this runs after receipt lookup but
+                    # before reserving and dispatching a new operation.
                     try:
                         self.bf.drain(resource.bf_token, timeout=0)
                     except TimeoutError:
@@ -284,6 +307,8 @@ class UnifiedRuntime(Runtime):
                             'use BrowserActionStatus. Wait for the pending operation or native cleanup '
                             'to finish before submitting another write. '
                             'Status, command output polling and command cancellation remain available.'}) from None
+                if write and name.startswith('Browser'):
+                    before_dispatch()
                 if name == 'OperationStatus':
                     return tool_result(self.operations.status(resource.key, args['request_id']))
                 if name in TOOL_REGISTRY:
@@ -291,7 +316,8 @@ class UnifiedRuntime(Runtime):
                         request_id = args.pop("request_id")
                         journaled = True
                         return self.operations.run(resource.key, request_id, name, args,
-                            lambda: resource.coding.call_tool(name, args, context=context))
+                            lambda: resource.coding.call_tool(name, args, context=context),
+                            before_dispatch=before_dispatch)
                     return resource.coding.call_tool(name, args, context=context)
                 if name == "SearchSession":
                     action = args.pop("action")
@@ -310,7 +336,8 @@ class UnifiedRuntime(Runtime):
                     request_id = args.pop("request_id")
                     journaled = True
                     return self.operations.run(resource.key, request_id, name, args,
-                        lambda: self.bf.submit(name, {"bf_task_id": resource.bf_token, **args}))
+                        lambda: self.bf.submit(name, {"bf_task_id": resource.bf_token, **args}),
+                        before_dispatch=before_dispatch)
                 return self.bf.call(name, {"bf_task_id": resource.bf_token, **args})
         except WorkflowError as exc:
             return tool_result({"ok": False, "error": {"code": exc.code, "details": exc.details}})
@@ -333,6 +360,35 @@ class UnifiedRuntime(Runtime):
                 'next_action': recovery_guidance()}})
         except Exception:
             return tool_result({"ok": False, "error": {"code": "EXECUTION_ERROR", "outcome": "unknown"}})
+
+    def _workflow_action(self, action, args):
+        """Fixed public actions share authorization, generation checks and receipts."""
+        if action == 'begin':
+            return self.registry.begin(self.principal, args['project_path'], args['request_id'],
+                                       args.get('access', 'write'), args.get('ttl', 120))
+        if action == 'list':
+            return self.registry.list(self.principal)
+        if action == 'release_idle':
+            return self.registry.release_idle(self.principal, args['workflow_ref'])
+        if action == 'resume':
+            return self.registry.resume(self.principal, args['workflow_ref'],
+                                        args['request_id'], args['expected_generation'])
+        if action == 'status':
+            return self._workflow_status(args['workflow_id'])
+        if action == 'activate':
+            return self.registry.activate(self.principal, args['workflow_id'])
+        if action == 'end':
+            return self.registry.end(self.principal, args['workflow_id'])
+        raise ValueError('INVALID_ARGUMENT')
+
+    def _workflow_status(self, token):
+        """Share the same ownership and resource-protection path for both APIs."""
+        result = self.registry.status(self.principal, token)
+        if result.get('state') == 'ACTIVE':
+            with self.registry.use(self.principal, token, control=True, touch=False) as resource:
+                result['commands'] = resource.coding.command_inventory()
+                result['job_processes'] = resource.coding.job_process_snapshot()
+        return result
 
     def close(self):
         if self._closed:

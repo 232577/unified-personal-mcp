@@ -13,12 +13,41 @@ from coding_tools_mcp.protocol import jsonrpc_error, response_id
 from coding_tools_mcp.server import MCPHandler
 from . import __version__
 from .bf.bootstrap import build_mcp
+from .diagnostics import elapsed_ms, trace_scope
 from .host import UnifiedRuntime
 from .protection import InstanceLock, prepare_private_directory
 from .tunnel_supervisor import TunnelSupervisor
 
 
 class PersonalMCPHandler(MCPHandler):
+    def log_message(self, format, *args):
+        # BaseHTTPRequestHandler logs raw request lines (including URL queries).
+        # The personal service records only structured metadata below instead.
+        pass
+
+    def send_response(self, code, message=None):
+        self._diagnostic_http_status = int(code)
+        return super().send_response(code, message)
+
+    def do_POST(self):
+        diagnostics = self.runtime.diagnostics
+        self._diagnostic_http_status = None
+        with trace_scope() as trace_id:
+            started = time.monotonic()
+            diagnostics.emit('http_received', trace_id)
+            try:
+                super().do_POST()
+            except BaseException:
+                diagnostics.emit('http_failed', trace_id, outcome='unknown',
+                                 http_status=self._diagnostic_http_status,
+                                 duration_ms=elapsed_ms(started))
+                raise
+            else:
+                # Handler completion does not prove receipt by the tunnel/client.
+                diagnostics.emit('http_finished', trace_id,
+                                 http_status=self._diagnostic_http_status,
+                                 duration_ms=elapsed_ms(started))
+
     def handle_rpc(self, request, *, transport_protocol_version=None):
         if request.get('method') != 'unified/tunnel/retry' or 'id' not in request:
             return super().handle_rpc(request, transport_protocol_version=transport_protocol_version)

@@ -17,6 +17,9 @@ class OperationJournal:
         self.retention_seconds = retention_seconds
         self.max_records = max_records
         self.max_retained_bytes = max_retained_bytes
+        # The host supplies permanently closed workflow identities after its
+        # registry is initialized. Standalone journals retain every receipt.
+        self.closed_owners = None
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS operations (
@@ -46,7 +49,8 @@ class OperationJournal:
     def result_policy(self):
         return {'retention_seconds': self.retention_seconds, 'max_result_bytes': self.max_result_bytes,
                 'max_retained_bytes': self.max_retained_bytes, 'max_records': self.max_records,
-                'expired_receipts': 'Retained for deduplication; never replayed.'}
+                'expired_receipts': 'Retained for deduplication; never replayed.',
+                'closed_workflow_receipts': 'Reclaimed at capacity only after permanent workflow closure.'}
 
     def _prune(self, db):
         db.execute('UPDATE operations SET result=NULL WHERE result IS NOT NULL AND updated<?',
@@ -103,7 +107,7 @@ class OperationJournal:
             # A cancelled Future or native error does not prove a side effect stopped.
             self._unknown(owner, request_id)
 
-    def run(self, owner, request_id, name, arguments, execute, *, timeout=180):
+    def run(self, owner, request_id, name, arguments, execute, *, timeout=180, before_dispatch=None):
         if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
             raise ValueError("REQUEST_ID_REQUIRED")
         digest = hashlib.sha256(json.dumps([name, arguments], sort_keys=True, ensure_ascii=False,
@@ -124,7 +128,21 @@ class OperationJournal:
                     raise ValueError('RESULT_EXPIRED')
                 return json.loads(row[2])
             if db.execute('SELECT COUNT(*) FROM operations').fetchone()[0] >= self.max_records:
-                raise ValueError('OPERATION_CAPACITY')
+                # ENDED/EXPIRED credentials cannot enter a tool again. Their
+                # receipts are therefore reclaimable without replaying any
+                # effect. Active, cleanup-blocked and unknown owners stay.
+                closed = self.closed_owners() if self.closed_owners is not None else ()
+                db.executemany('DELETE FROM operations WHERE owner=?',
+                               ((key,) for key in closed if key != owner))
+                if db.execute('SELECT COUNT(*) FROM operations').fetchone()[0] >= self.max_records:
+                    raise ValueError('OPERATION_CAPACITY')
+            # The caller already holds its workflow authorization/write gate.
+            # Check pending native effects only for genuinely new dispatches;
+            # a completed/failed receipt must retain its original result above.
+            # This hook must be a bounded local check, not work or network I/O.
+            # Rejection happens before reservation, so it is not an unknown write.
+            if before_dispatch is not None:
+                before_dispatch()
             db.execute("INSERT INTO operations (owner,request_id,digest,state,result,name,updated) "
                        "VALUES (?,?,?,'running',NULL,?,?)", (owner, request_id, digest, name, self.clock()))
         try:

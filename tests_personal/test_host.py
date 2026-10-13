@@ -45,11 +45,14 @@ def workflow(host, access="write"):
 
 def test_exact_catalog_and_no_global_registry_change(host):
     tools = host.list_tools()["tools"]
-    assert len(tools) == 50 and len(TOOL_REGISTRY) == 18
+    assert len(tools) == 58 and len(TOOL_REGISTRY) == 18
+    assert {'workflow_list', 'workflow_status', 'command_status', 'workflow_begin',
+            'workflow_activate', 'workflow_resume', 'workflow_end', 'workflow_release_idle'} <= {tool['name'] for tool in tools}
     assert "task_context" not in {t["name"] for t in tools}
     for tool in tools:
         assert tool["outputSchema"]
-        if tool["name"] not in {"UnifiedTask", "server_info"}:
+        if tool["name"] not in {"UnifiedTask", "server_info", "workflow_list", 'workflow_begin',
+                                'workflow_resume', 'workflow_release_idle'}:
             assert "workflow_id" in tool["inputSchema"]["required"]
         assert "bf_task_id" not in tool["inputSchema"].get("properties", {})
 
@@ -109,7 +112,7 @@ def test_http_authentication_happens_before_dispatch(host):
         headers["Authorization"] = "Bearer " + host.auth_token
         with urllib.request.urlopen(urllib.request.Request(url, request_body, headers)) as response:
             result = json.load(response)
-        assert len(result["result"]["tools"]) == 50
+        assert len(result["result"]["tools"]) == 58
     finally:
         server.shutdown()
         server.server_close()

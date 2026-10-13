@@ -45,7 +45,9 @@ class FakeScheduler:
             raise RuntimeError("fixture registration failure")
         return {'xml': self.current['xml']}
 
-    def restore(self, name, previous):
+    def restore(self, name, previous, *, expected_xml=None):
+        if expected_xml is not None and self.current.get('xml') != expected_xml:
+            raise RuntimeError('CONCURRENT_TASK_CHANGE')
         self.calls.append("restore")
         self.current = dict(previous)
 
@@ -118,6 +120,41 @@ def test_registration_failure_restores_previous_definition_and_keeps_backup(tmp_
     backups = list((item.config.data_root / "autostart" / "backups").glob("*.json"))
     assert len(backups) == 1
     assert json.loads(backups[0].read_text())["previous"]["xml"] == "<Task>old</Task>"
+
+
+def test_final_status_failure_restores_registered_target(tmp_path, monkeypatch):
+    previous = {'exists': True, 'enabled': True, 'managed': True, 'xml': '<Task>old</Task>'}
+    scheduler = FakeScheduler(dict(previous))
+    item = manager(tmp_path, scheduler=scheduler)
+    def fail():
+        raise RuntimeError('FINAL_STATUS_FAILED')
+    monkeypatch.setattr(item, 'status', fail)
+    with pytest.raises(RuntimeError, match='AUTOSTART_UPDATE_FAILED'):
+        item.enable(packaged(tmp_path), expected_version='0.1.6')
+    assert scheduler.current == previous
+
+
+@pytest.mark.parametrize('current_xml,restored', [('installed', True), ('external', False)])
+def test_restore_checks_current_xml_in_the_same_com_operation(monkeypatch, current_xml, restored):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from personal_mcp.autostart import WindowsTaskScheduler
+    scheduler = WindowsTaskScheduler()
+    writes = []
+    folder = SimpleNamespace(GetTask=lambda name: SimpleNamespace(Xml=current_xml),
+        RegisterTask=lambda *args: writes.append(args))
+    @contextmanager
+    def fake_folder():
+        yield None, folder
+    monkeypatch.setattr(scheduler, '_folder', fake_folder)
+    monkeypatch.setattr(scheduler, '_sid', lambda: 'fixture-user')
+    if restored:
+        scheduler.restore('fixture', {'exists': True, 'xml': 'old'}, expected_xml='installed')
+        assert writes[0][1] == 'old'
+    else:
+        with pytest.raises(RuntimeError, match='CONCURRENT_TASK_CHANGE'):
+            scheduler.restore('fixture', {'exists': True, 'xml': 'old'}, expected_xml='installed')
+        assert not writes
 
 
 def test_validated_upgrade_is_next_login_only_and_disable_does_not_stop_service(tmp_path):
@@ -232,6 +269,7 @@ def test_installation_metadata_and_script_are_written_inside_package(tmp_path):
     metadata = json.loads((tmp_path / "package-metadata.json").read_text())
     assert metadata["name"] == "unified-personal-mcp" and metadata["version"]
     assert (tmp_path / "scripts/install-autostart.ps1").is_file()
+    assert (tmp_path / "scripts/switch_managed_release.py").is_file()
 
 
 def test_windows_command_line_preserves_unicode_and_space_paths():

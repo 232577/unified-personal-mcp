@@ -1,0 +1,655 @@
+{
+  "coverage": "Local invalid-input/output-contract and workflow-isolation tests only; not platform safety approval or real desktop/browser action acceptance.",
+  "source_run": "verification/isolation-20261009-final-v2",
+  "tools_per_mode": 53,
+  "reports": [
+    {
+      "catalog_revision": "9f09f4f655041148869330f3cce0b626abb5851a7a22b670561885ebe01fe396",
+      "permission_mode": "full_control",
+      "checks": [
+        {
+          "tool": "App",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserAction",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserActionStatus",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserDownload",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserNavigate",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserPages",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserScreenshot",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserSession",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserSnapshot",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserUpload",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserWaitFor",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Click",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Clipboard",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "DisplayInventory",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "LaunchApplication",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Move",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Notification",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "OperationStatus",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Screenshot",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Scroll",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "SearchSession",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Shortcut",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Snapshot",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Type",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "UnifiedTask",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Wait",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "WaitFor",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "WindowControl",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "WindowInventory",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "WindowScreenshot",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "WindowSnapshot",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "apply_patch",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "check_exec_environment",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "command_status",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "exec_command",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "git_blame",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "git_diff",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "git_log",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "git_show",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "git_status",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "kill_command",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "list_dir",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "list_files",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "prepare_browser_session",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "read_file",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "read_output",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "request_permissions",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "search_text",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "server_info",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "view_image",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "workflow_list",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "workflow_status",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "write_stdin",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        }
+      ]
+    },
+    {
+      "catalog_revision": "9edc1df5fbcd1622ded3a0cbcdadd9e3729c916c60f64aa81cc57b8de1148457",
+      "permission_mode": "trusted",
+      "checks": [
+        {
+          "tool": "App",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserAction",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserActionStatus",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserDownload",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserNavigate",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserPages",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserScreenshot",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserSession",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserSnapshot",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserUpload",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "BrowserWaitFor",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Click",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Clipboard",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "DisplayInventory",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "LaunchApplication",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Move",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Notification",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "OperationStatus",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Screenshot",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Scroll",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "SearchSession",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Shortcut",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Snapshot",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Type",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "UnifiedTask",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "Wait",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "WaitFor",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "WindowControl",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "WindowInventory",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "WindowScreenshot",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "WindowSnapshot",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "apply_patch",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "check_exec_environment",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "command_status",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "exec_command",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "git_blame",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "git_diff",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "git_log",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "git_show",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "git_status",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "kill_command",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "list_dir",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "list_files",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "prepare_browser_session",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "read_file",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "read_output",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "request_permissions",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "search_text",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "server_info",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "view_image",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "workflow_list",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "workflow_status",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        },
+        {
+          "tool": "write_stdin",
+          "invalid_input_rejected": true,
+          "output_schema_valid": true,
+          "workflow_preserved": true
+        }
+      ]
+    }
+  ]
+}

@@ -24,14 +24,14 @@ def test_same_program_starts_authenticated_catalog_and_stops(tmp_path):
     service = LocalService(cfg, assets_root=ROOT / "resources")
     try:
         status = service.start()
-        assert status["running"] and status["tools"] == 50
+        assert status["running"] and status["tools"] == 58
         assert not status["tunnel_connected"]
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode()
         key = (cfg.data_root / "backend.key").read_text()
         req = urllib.request.Request(f"http://127.0.0.1:{cfg.port}/mcp", body,
             {"Content-Type": "application/json", "Authorization": "Bearer " + key})
         with urllib.request.urlopen(req) as response:
-            assert len(json.load(response)["result"]["tools"]) == 50
+            assert len(json.load(response)["result"]["tools"]) == 58
         second = LocalService(cfg, assets_root=ROOT / "resources")
         with pytest.raises(RuntimeError, match="INSTANCE_ALREADY_RUNNING"):
             second.start()
