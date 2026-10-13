@@ -140,7 +140,30 @@ def test_symbolic_link_inside_input_is_rejected(tmp_path):
 
 def test_builder_publishes_only_source_payload_and_matching_hashes(tmp_path):
     build = import_module('scripts.build_update').build
-    result = build(tmp_path / 'source-update', zip_output=True)
+    root = tmp_path / 'source-fixture'
+    sources = {
+        'personal_mcp/__init__.py': '__version__ = "0.1.13"',
+        'bf_automation/__init__.py': '', 'coding_tools_mcp/__init__.py': '',
+        'personal_mcp/__pycache__/stale.pyc': 'excluded bytecode',
+        'packaging/run.py': 'pass', 'packaging/startup_diagnostics.py': 'pass',
+        'packaging/update.cmd': 'update', 'packaging/startup-diagnostics.cmd': 'diagnostic',
+        'scripts/prepare_update.py': 'pass', 'scripts/switch_managed_release.py': 'pass',
+        'scripts/install-autostart.ps1': 'install', 'scripts/smoke_portable.py': 'pass',
+        'LICENSE': 'license', 'NOTICE': 'notice', 'README.md': 'readme',
+        'verification.md': 'verified', 'requirements-windows.lock': 'fixture-lock',
+        'third_party/README.md': 'component provenance',
+        'docs/personal/换机使用说明.txt': 'installation guidance',
+        'examples/personal/settings.example.json': '{}',
+        'resources/bin/rg.exe': 'fixture search binary',
+        'resources/browsers/chromium-fixture/chrome.exe': 'fixture browser binary',
+        'resources/browsers/chromium-fixture/debug.log': 'excluded runtime log',
+        'resources/tunnel-client/tunnel-client.exe': 'fixture tunnel binary',
+    }
+    for relative, content in sources.items():
+        source = root / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(content, encoding='utf-8')
+    result = build(tmp_path / 'source-update', root=root, zip_output=True)
     update = tmp_path / 'source-update'
     rows = import_module('scripts.prepare_update').validate_manifest(update)
     assert result['third_party_binaries'] is False
@@ -149,6 +172,10 @@ def test_builder_publishes_only_source_payload_and_matching_hashes(tmp_path):
     assert not any(name.startswith('resources/') or name.endswith(('.pyc', '.exe', '.dll', '.pyd')) for name in rows)
     assert all((update / f'app/{name}/__init__.py').is_file()
                for name in ('personal_mcp', 'bf_automation', 'coding_tools_mcp'))
+    resources = json.loads((update / 'update-metadata.json').read_text())['resources']
+    assert resources == {relative.removeprefix('resources/'): hashlib.sha256(content.encode()).hexdigest()
+                         for relative, content in sources.items()
+                         if relative.startswith('resources/') and not relative.endswith('debug.log')}
 
 
 @pytest.mark.parametrize('task', [
