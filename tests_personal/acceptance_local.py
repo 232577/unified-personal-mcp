@@ -46,7 +46,7 @@ class Client:
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.output, self.sequence = output, 0
         self.tools = {t["name"]: t for t in self.rpc("tools/list", {})["tools"]}
-        assert len(self.tools) == 58
+        assert len(self.tools) == 63
         assert {'workflow_list', 'workflow_status', 'command_status'} <= self.tools.keys()
 
     def rpc(self, method, params):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .errors import JsonRpcError
@@ -53,9 +53,11 @@ MODERN_METHODS = frozenset(
         "ping",
         "tools/list",
         "tools/call",
+        "resources/list",
+        "resources/read",
     }
 )
-MODERN_CACHEABLE_METHODS = frozenset({DISCOVER_METHOD, "tools/list"})
+MODERN_CACHEABLE_METHODS = frozenset({DISCOVER_METHOD, "tools/list", "resources/list", "resources/read"})
 MODERN_RESULT_TYPE = "complete"
 
 # The only two ``clientInfo`` fields anything reads, and the length a label
@@ -78,6 +80,7 @@ class RequestContext:
     era: str = LEGACY_ERA
     protocol_version: str = LATEST_LEGACY_PROTOCOL_VERSION
     client_info: Mapping[str, Any] | None = None
+    ui_session: str | None = field(default=None, repr=False)
 
 
 def jsonrpc_error(
@@ -445,6 +448,8 @@ def _dispatch_modern(
         return runtime.discover_payload()
     if method == "tools/list":
         return runtime.list_tools()
+    if method in {'resources/list', 'resources/read'}:
+        return _resource_call(runtime, method, params)
     return _call_tool(runtime, params, context)
 
 
@@ -490,7 +495,22 @@ def _dispatch_legacy(
         return runtime.list_tools()
     if method == "tools/call":
         return _call_tool(runtime, params, context)
+    if method in {'resources/list', 'resources/read'}:
+        return _resource_call(runtime, method, params)
     raise JsonRpcError(-32601, f"Unknown method: {method}")
+
+
+def _resource_call(runtime, method, params):
+    handler = getattr(runtime, 'list_resources' if method == 'resources/list' else 'read_resource', None)
+    if handler is None:
+        raise JsonRpcError(-32601, f"Unknown method: {method}")
+    if method == 'resources/list':
+        if params.get('cursor'):
+            raise JsonRpcError(-32602, 'Resource pagination is not supported')
+        return handler()
+    if not isinstance(params.get('uri'), str):
+        raise JsonRpcError(-32602, 'resources/read requires a URI')
+    return handler(params['uri'])
 
 
 def _call_tool(runtime: Any, params: dict[str, Any], context: RequestContext) -> dict[str, Any]:
@@ -501,4 +521,10 @@ def _call_tool(runtime: Any, params: dict[str, Any], context: RequestContext) ->
         arguments = {}
     if not isinstance(arguments, dict):
         raise JsonRpcError(-32602, "tools/call arguments must be an object")
+    metadata = params.get('_meta')
+    capability = metadata.get('unified/ui_session') if isinstance(metadata, dict) else None
+    if capability is not None:
+        if not isinstance(capability, str) or not 20 <= len(capability) <= 128:
+            raise JsonRpcError(-32602, 'Invalid UI session metadata')
+        context = replace(context, ui_session=capability)
     return runtime.call_tool(params["name"], arguments, context=context)

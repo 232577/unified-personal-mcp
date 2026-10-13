@@ -50,6 +50,9 @@ class BFExecutor:
             # Only a conclusively exited thread may relinquish the shared server.
             assert not previous.thread.is_alive() and not previous.requests
             self._health["recovery_attempts"] += 1
+        guard = getattr(self.server, '_bf_desktop_guard', None)
+        if guard is not None:
+            guard.invalidate()
         generation = _Generation(previous.number + 1 if previous else 1)
         generation.thread = threading.Thread(target=self._thread_main, args=(generation,),
             daemon=True, name=f"personal-bf-{generation.number}")

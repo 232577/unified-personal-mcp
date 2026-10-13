@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unified-personal-mcp"
-version = "0.1.13"
+version = "0.1.14"
 description = "One configurable Windows host for coding, desktop and browser tools over an OpenAI Secure MCP Tunnel."
 requires-python = ">=3.13,<3.14"
 dependencies = [
@@ -38,3 +38,6 @@ coding-tools-mcp = "coding_tools_mcp.server:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["personal_mcp*", "bf_automation*", "coding_tools_mcp*"]
+
+[tool.setuptools.package-data]
+personal_mcp = ["ui/*.html", "ui/*.css", "ui/*.js", "ui/*.json", "ui/*.txt"]

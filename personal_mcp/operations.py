@@ -85,6 +85,9 @@ class OperationJournal:
         encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
         data = encoded.encode('utf-8')
         failed = isinstance(result, dict) and (result.get('isError') is True or result.get('ok') is False)
+        payload = result.get('structuredContent', result) if isinstance(result, dict) else {}
+        error = payload.get('error') if isinstance(payload, dict) else None
+        uncertain = isinstance(error, dict) and error.get('outcome') == 'unknown'
         if len(data) > self.max_result_bytes:
             result = {'isError': True, 'content': [{'type': 'text', 'text': 'RESULT_TRUNCATED'}],
                 'structuredContent': {
@@ -96,7 +99,8 @@ class OperationJournal:
         with self._db() as db:
             db.execute("UPDATE operations SET state=?,result=?,updated=? WHERE owner=? AND request_id=? "
                        "AND state IN ('dispatched','running','unknown')",
-                       ('failed' if failed else 'completed', encoded, self.clock(), owner, request_id))
+                       ('unknown' if uncertain else 'failed' if failed else 'completed',
+                        encoded, self.clock(), owner, request_id))
             self._prune(db)
         return result
 

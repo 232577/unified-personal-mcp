@@ -16,7 +16,7 @@ def test_actual_http_catalog_has_consistent_human_readable_titles(host):
     with http_host(host) as url:
         result = post(url, {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'}, host.auth_token)
     tools = result['result']['tools']
-    assert len(tools) == 58
+    assert len(tools) == 63
     for descriptor in tools:
         name = descriptor['name']
         assert descriptor.get('title', '').strip(), name

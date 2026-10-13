@@ -31,7 +31,7 @@ def fixtures(tmp_path):
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding='utf-8')
     spec = {'format': 'unified-source-update-v1', 'version': '0.1.13',
-            'base_versions': ['0.1.10', '0.1.11', '0.1.12'],
+            'base_versions': ['0.1.10', '0.1.11', '0.1.12', '0.1.13'],
             'lock_sha256': hashlib.sha256(b'same-lock').hexdigest(),
             'resources': {'bin/rg.exe': hashlib.sha256(b'resource').hexdigest()}}
     (update / 'update-metadata.json').write_text(json.dumps(spec), encoding='utf-8')

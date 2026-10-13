@@ -53,6 +53,11 @@ CAPTURE = obj({
     "capture_mode": enum("wgc_d3d11", "staging_wgc_d3d11", "print_window"),
     "width": POSITIVE_INT, "height": POSITIVE_INT, "staging_used": BOOL,
     "path": NONEMPTY, "sha256": HASH, "fallback_chain": array(STR),
+    "capture_rect": RECT,
+    "client_origin": nullable(POINT),
+    "client_size": nullable(array(NONNEG_INT, minItems=2, maxItems=2)),
+    "source_width": POSITIVE_INT, "source_height": POSITIVE_INT,
+    "coordinate_space": enum("window_surface_pixels"), "geometry_verified": BOOL,
 }, required=["window_id", "pid", "title", "backend", "capture_mode", "width", "height",
              "staging_used", "path", "sha256"])
 ELEMENT = obj({

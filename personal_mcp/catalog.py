@@ -301,6 +301,8 @@ def unified_catalog(bf_server, *, full_control=False, search_sessions=4):
     search["inputSchema"]["allOf"] = [{"if": {"properties": {"action": {"const": "start"}}},
         "then": {"required": ["pattern"]}, "else": {"required": ["search_id"]}}]
     tools["SearchSession"] = search
+    from .desktop_catalog import desktop_tools
+    tools.update(desktop_tools())
     apply_tool_presentation(tools, full_control=full_control)
     validate_catalog_contract(tools, full_control=full_control)
     return tools

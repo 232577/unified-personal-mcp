@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 FORMAT = 'unified-source-update-v1'
-BASE_VERSIONS = ('0.1.10', '0.1.11', '0.1.12')
+BASE_VERSIONS = ('0.1.10', '0.1.11', '0.1.12', '0.1.13')
 MODULES = ('personal_mcp', 'bf_automation', 'coding_tools_mcp')
 ROOT_FILES = {'LICENSE', 'NOTICE', 'README.md', 'verification.md', 'requirements-windows.lock',
               'package-metadata.json', 'update-metadata.json', 'update.cmd', '使用前先看.txt', '启动诊断.cmd'}
@@ -88,6 +88,8 @@ def payload_allowed(relative):
         return True
     parts = relative.split('/')
     if parts[0] == 'app':
+        if len(parts) == 4 and parts[1:3] == ['personal_mcp', 'ui']:
+            return Path(relative).suffix.lower() in {'.html', '.css', '.js', '.json', '.txt'}
         return (relative in {'app/run.py', 'app/startup_diagnostics.py'} or
                 len(parts) >= 3 and parts[1] in MODULES and relative.endswith('.py'))
     if parts[0] == 'scripts':
@@ -133,6 +135,10 @@ def prepare(base, update, destination=None):
             or not re.fullmatch(r'\d+\.\d+\.\d+', str(spec.get('version', '')))):
         raise ValueError('UPDATE_METADATA_INVALID')
     version = spec['version']
+    if version == '0.1.14' and not {
+            'app/personal_mcp/ui/desktop.html', 'app/personal_mcp/ui/desktop.js',
+            'app/personal_mcp/ui/desktop.css', 'app/personal_mcp/ui/THIRD_PARTY_NOTICES.txt'} <= update_rows.keys():
+        raise ValueError('UPDATE_UI_INCOMPLETE')
     destination = Path(destination) if destination else base.parent / f'UnifiedPersonalMCP-{version}'
     destination = destination.absolute()
     for parent in (destination, *destination.parents):
@@ -217,14 +223,14 @@ def switch_prepared(base, candidate):
     base_version = package_version(plain_tree(base))
     prepared = {'bundle': str(candidate), 'base_bundle': str(base)}
     config_path = switch_target(WindowsTaskScheduler().status(TASK_NAME), prepared)
-    if metadata.get('tool_count') != 58:
+    if metadata.get('tool_count') != 63:
         raise ValueError('UPDATE_TOOL_RECEIPT_INVALID')
     config = load_config(config_path)
     output = config.data_root / ('update-' + uuid.uuid4().hex)
     command = [str(candidate / 'resources/python/python.exe'), '-B', '-s',
                str(candidate / 'scripts/switch_managed_release.py'), '--run', '--config', str(config_path),
                '--candidate', str(candidate), '--old-bundle', str(base), '--output', str(output),
-               '--version', version, '--old-version', base_version, '--tools', '58']
+               '--version', version, '--old-version', base_version, '--tools', '63']
     completed = subprocess.run(command, check=False, cwd=candidate)
     receipt = output / 'result.json'
     if receipt.is_file():

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>桌面操控台</title>
+  <link rel="stylesheet" href="desktop.css">
+</head>
+<body>
+<main class="console" aria-label="桌面操控台">
+  <header class="topbar">
+    <div class="device"><span class="status-dot" id="status-dot"></span><div><strong id="device-label">桌面操控台</strong><small id="connection-label">正在连接</small></div></div>
+    <label class="control-switch"><span id="control-label">仅查看</span><input id="control-toggle" type="checkbox" role="switch" aria-label="允许操控远端桌面" disabled><span class="switch-track" aria-hidden="true"></span></label>
+  </header>
+  <section class="targetbar" aria-label="选择画面">
+    <label for="target-kind">查看</label><select id="target-kind"><option value="display">显示器</option><option value="window">应用窗口</option></select>
+    <label class="sr-only" for="target-id">画面目标</label><select id="target-id" disabled><option value="">正在读取</option></select>
+    <button id="refresh-targets" class="icon-button" title="刷新显示器和窗口" aria-label="刷新显示器和窗口">↻</button>
+  </section>
+  <section class="stage" id="stage" aria-label="远端画面">
+    <canvas id="desktop-canvas" tabindex="0" aria-label="远端画面，方向键移动操作点，Enter 点击，Escape 停止操控" aria-describedby="stage-help"></canvas>
+    <span id="pointer-marker" class="pointer-marker" hidden aria-hidden="true"></span>
+    <div id="empty-state" class="empty-state"><span class="screen-glyph" aria-hidden="true">▣</span><strong id="empty-title">正在读取画面</strong><p id="empty-detail">连接后选择显示器或应用窗口。</p></div>
+    <span id="frame-badge" class="frame-badge" hidden>仅查看</span>
+  </section>
+  <div class="feedback" role="status" aria-live="polite"><span id="feedback-text">正在连接设备。</span><button id="check-action" hidden>查询操作结果</button><button id="acknowledge-action" hidden disabled>已检查画面，保持停止</button><button id="reconnect" hidden>重新连接</button></div>
+  <footer class="telemetry"><span id="frame-age">画面 —</span><span id="latency">往返 —</span><span id="refresh-state">等待连接</span><button id="pause-refresh" disabled>暂停刷新</button><button id="refresh-frame" aria-label="立即刷新画面" disabled>刷新</button></footer>
+  <p id="stage-help" class="stage-help">开启操控后可点击画面。文字与快捷键在下方发送。</p>
+  <nav class="tool-tabs" aria-label="操作工具"><button data-panel="text-panel" aria-expanded="false" aria-controls="text-panel">文字输入</button><button data-panel="shortcut-panel" aria-expanded="false" aria-controls="shortcut-panel">按键与指针</button><button data-panel="clipboard-panel" aria-expanded="false" aria-controls="clipboard-panel">剪贴板</button><button data-panel="files-panel" aria-expanded="false" aria-controls="files-panel">文件收发</button></nav>
+  <section class="drawer" id="text-panel" hidden aria-label="文字输入"><form id="literal-form" novalidate><label for="literal-text">发送文字</label><textarea id="literal-text" rows="3" maxlength="8192" placeholder="输入文字，确认后发送到当前窗口。" autocomplete="off" spellcheck="false"></textarea><div class="drawer-actions"><small>支持中文输入，不自动按回车。</small><button id="send-text" class="primary" type="submit" data-write disabled>发送文字</button></div></form></section>
+  <section class="drawer" id="shortcut-panel" hidden aria-label="按键与指针"><div class="shortcut-grid"><button data-keys="ENTER" data-write disabled>回车</button><button data-keys="ESC" data-write disabled>Esc</button><button data-keys="TAB" data-write disabled>Tab</button><button data-keys="CTRL,A" data-write disabled>全选</button><button data-keys="CTRL,C" data-write disabled>复制</button><button data-keys="CTRL,V" data-write disabled>粘贴</button><button data-keys="CTRL,Z" data-write disabled>撤销</button><button data-keys="CTRL,S" data-write disabled>保存</button></div><div class="pointer-actions"><span id="pointer-position">操作点 —</span><button id="pointer-click" data-write disabled>点击操作点</button><button id="pointer-right" data-write disabled>右键</button><button id="scroll-up" data-write disabled>向上滚动</button><button id="scroll-down" data-write disabled>向下滚动</button></div><form id="drag-form" class="coordinate-form" novalidate><label>从 X<input id="drag-x" type="number" min="0" inputmode="numeric"></label><label>Y<input id="drag-y" type="number" min="0" inputmode="numeric"></label><label>至 X<input id="drag-to-x" type="number" min="0" inputmode="numeric"></label><label>Y<input id="drag-to-y" type="number" min="0" inputmode="numeric"></label><button type="submit" data-write disabled>执行拖动</button></form></section>
+  <section class="drawer" id="clipboard-panel" hidden aria-label="剪贴板"><label for="clipboard-text">远端剪贴板文字</label><textarea id="clipboard-text" rows="3" maxlength="8192" autocomplete="off" spellcheck="false" placeholder="点击读取，或填写要写入的文字。"></textarea><div class="drawer-actions"><small>只在你点击时读取或写入。</small><button id="read-clipboard" disabled>读取</button><button id="write-clipboard" data-write disabled>写入远端</button></div></section>
+  <section class="drawer" id="files-panel" hidden aria-label="文件收发"><form id="upload-form" novalidate><label for="upload-file">发送文件</label><input id="upload-file" type="file"><label for="upload-path">远端保存路径</label><input id="upload-path" type="text" autocomplete="off" placeholder="填写完整目标路径"><div class="drawer-actions"><small>每个文件最多 128 MB，已有文件不会覆盖。</small><button id="upload-button" type="submit" disabled>发送文件</button></div></form><form id="download-form" novalidate><label for="download-path">远端文件路径</label><input id="download-path" type="text" autocomplete="off" placeholder="填写要接收的文件路径"><div class="drawer-actions"><button id="download-button" type="submit" disabled>接收文件</button></div></form><div class="transfer-progress"><progress id="transfer-progress" value="0" max="100" aria-label="文件收发进度"></progress><span id="transfer-label">尚未开始</span><button id="stop-transfer" hidden>停止收发</button></div></section>
+</main>
+<script src="desktop.js" defer></script>
+</body>
+</html>

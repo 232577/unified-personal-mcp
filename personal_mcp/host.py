@@ -1,6 +1,7 @@
 """Single authenticated HTTP host for coding and in-process BF automation."""
 
 import json
+import threading
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -85,7 +86,9 @@ class WorkflowResources:
                 self.bf_closed = True
         except Exception as exc:
             errors.append(exc)
-        for release in (lambda: self.host.searches.end_owner(self.key), self.coding.close):
+        for release in (lambda: self.host.searches.end_owner(self.key),
+                        lambda: self.host.desktop.close_owner(self.key) if hasattr(self.host, 'desktop') else None,
+                        self.coding.close):
             try:
                 release()
             except Exception as exc:
@@ -131,6 +134,8 @@ class UnifiedRuntime(Runtime):
                 recovery=lambda row: self.bf_server._bf_store.recover_context(row["token_hash"]))
             self.recovery_status = self.registry.recover()
             self.operations.closed_owners = self.registry.closed_operation_owners
+            from .desktop_console import DesktopConsoleManager
+            self.desktop = DesktopConsoleManager(self)
         except BaseException:
             self.bf.close()
             self.searches.close()
@@ -142,6 +147,24 @@ class UnifiedRuntime(Runtime):
 
     def list_tools(self):
         return {"tools": deepcopy(list(self.catalog.values()))}
+
+    def initialize_result(self, *args, **kwargs):
+        payload = super().initialize_result(*args, **kwargs)
+        payload['capabilities']['resources'] = {'subscribe': False, 'listChanged': False}
+        return payload
+
+    def discover_payload(self):
+        payload = super().discover_payload()
+        payload['capabilities']['resources'] = {'subscribe': False, 'listChanged': False}
+        return payload
+
+    def list_resources(self):
+        from .desktop_console import resources_list
+        return resources_list()
+
+    def read_resource(self, uri):
+        from .desktop_console import resource_read
+        return resource_read(uri)
 
     def health_snapshot(self):
         health = self.health_provider() if self.health_provider else {
@@ -253,6 +276,10 @@ class UnifiedRuntime(Runtime):
                 self.diagnostics.emit('tool_validated', trace_id, tool=name,
                                       action=arguments.get('action'))
             args = dict(arguments)
+            if name == 'DesktopConsole':
+                return self.desktop.open(args['workflow_id'])
+            if name in {'DesktopView', 'DesktopAction', 'DesktopStatus', 'DesktopFiles'}:
+                return self.desktop.handle(name, args, context)
             if name == "server_info":
                 info = self.server_info_payload()
                 browser = getattr(self.bf_server, "_bf_browser_manager", None)
@@ -371,14 +398,28 @@ class UnifiedRuntime(Runtime):
         if action == 'release_idle':
             return self.registry.release_idle(self.principal, args['workflow_ref'])
         if action == 'resume':
-            return self.registry.resume(self.principal, args['workflow_ref'],
-                                        args['request_id'], args['expected_generation'])
+            with self.registry.lock:
+                row = self.registry._reference_row(self.principal, args['workflow_ref'])
+                gate = self.registry.workflow_locks.setdefault(row['token_hash'], threading.RLock())
+            with gate:
+                with self.registry.lock:
+                    before = self.registry._reference_row(self.principal, args['workflow_ref'])['credential_generation']
+                resumed = self.registry.resume(self.principal, args['workflow_ref'],
+                                                args['request_id'], args['expected_generation'])
+                if resumed.get('ok') and resumed.get('credential_generation') != before:
+                    self.desktop.revoke_owner(resumed['workflow_ref'][4:])
+                return resumed
         if action == 'status':
             return self._workflow_status(args['workflow_id'])
         if action == 'activate':
             return self.registry.activate(self.principal, args['workflow_id'])
         if action == 'end':
-            return self.registry.end(self.principal, args['workflow_id'])
+            with self.registry.lock:
+                row = self.registry._row(self.principal, args['workflow_id'])
+                gate = self.registry.workflow_locks.setdefault(row['token_hash'], threading.RLock())
+            with gate:
+                self.desktop.revoke_owner(row['token_hash'])
+                return self.registry.end(self.principal, args['workflow_id'])
         raise ValueError('INVALID_ARGUMENT')
 
     def _workflow_status(self, token):
@@ -393,7 +434,9 @@ class UnifiedRuntime(Runtime):
     def close(self):
         if self._closed:
             return
+        self.desktop.revoke_all()
         self.registry.close()
+        self.desktop.close()
         self.searches.close()
         self.bf.close()
         manager = getattr(self.bf_server, "_bf_browser_manager", None)

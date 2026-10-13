@@ -24,7 +24,7 @@ READ_ONLY_DESCRIPTORS = frozenset({
     'Screenshot', 'Snapshot', 'Wait', 'WaitFor', 'WindowInventory',
     'WindowScreenshot', 'WindowSnapshot', 'BrowserWaitFor', 'BrowserSnapshot',
     'BrowserScreenshot', 'BrowserActionStatus', 'workflow_list', 'workflow_status',
-    'OperationStatus', 'command_status',
+    'OperationStatus', 'command_status', 'DesktopView', 'DesktopStatus',
 })
 
 WRITE_DESCRIPTORS = frozenset({
@@ -33,6 +33,7 @@ WRITE_DESCRIPTORS = frozenset({
     'prepare_browser_session', 'WindowControl', 'LaunchApplication',
     'BrowserAction', 'BrowserUpload', 'BrowserDownload', 'BrowserSession',
     'BrowserPages', 'BrowserNavigate', 'UnifiedTask', 'SearchSession',
+    'DesktopConsole', 'DesktopAction', 'DesktopFiles',
 }) | frozenset(WORKFLOW_ACTIONS)
 
 KNOWN_TOOLS = READ_ONLY_DESCRIPTORS | WRITE_DESCRIPTORS

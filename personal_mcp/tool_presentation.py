@@ -2,6 +2,11 @@
 
 
 TOOL_TITLES = {
+    'DesktopConsole': 'Open remote desktop side panel',
+    'DesktopView': 'Observe remote desktop',
+    'DesktopAction': 'Control remote desktop',
+    'DesktopStatus': 'Read remote desktop action receipt',
+    'DesktopFiles': 'Transfer remote desktop files',
     'server_info': 'Inspect server capabilities',
     'check_exec_environment': 'Inspect command environment',
     'read_file': 'Read file text',

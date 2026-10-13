@@ -75,7 +75,9 @@ def main():
         report['server_version'] = initialize['serverInfo']['version']
         invoke('initialize', auth=False, expected_exit=3)
         tools = invoke('tools/list')['tools']
-        assert len(tools) == 58
+        assert len(tools) == 63
+        assert {'DesktopConsole', 'DesktopView', 'DesktopAction', 'DesktopStatus',
+                'DesktopFiles'} <= {tool['name'] for tool in tools}
         assert {'workflow_begin', 'workflow_activate', 'workflow_resume', 'workflow_end',
                 'workflow_release_idle'} <= {tool['name'] for tool in tools}
         assert {'OperationStatus', 'workflow_list', 'workflow_status', 'command_status'} <= {tool['name'] for tool in tools}

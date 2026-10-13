@@ -42,7 +42,7 @@ def exercise_invalid_input_isolation(host):
     host.registry.clock = lambda: now
     before = host.registry.status(host.principal, token)
     names = {tool['name'] for tool in host.list_tools()['tools']}
-    assert len(names) == 58 and {'BrowserAction', 'workflow_begin', 'workflow_end'} <= names
+    assert len(names) == 63 and {'BrowserAction', 'workflow_begin', 'workflow_end'} <= names
     observed = []
     for name in sorted(names):
         rejected = call(host, name, unexpected_field='fixture-must-not-be-executed')

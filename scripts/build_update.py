@@ -28,6 +28,12 @@ def build(destination, *, root=ROOT, zip_output=False):
             files[f'app/{module}/{source.relative_to(root / module).as_posix()}'] = source
     files.update({f'app/{name}': root / 'packaging' / name
                   for name in ('run.py', 'startup_diagnostics.py')})
+    ui = root / 'personal_mcp/ui'
+    if ui.is_dir():
+        for source in plain_tree(ui).iterdir():
+            relative = 'app/personal_mcp/ui/' + source.name
+            if source.is_file() and payload_allowed(relative):
+                files[relative] = source
     for name in ('prepare_update.py', 'switch_managed_release.py', 'install-autostart.ps1', 'smoke_portable.py'):
         files[f'scripts/{name}'] = root / 'scripts' / name
     for name in ('LICENSE', 'NOTICE', 'README.md', 'verification.md', 'requirements-windows.lock'):
@@ -61,7 +67,7 @@ def build(destination, *, root=ROOT, zip_output=False):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
     for name, content in (('update-metadata.json', metadata),
-                          ('package-metadata.json', {'name': 'unified-personal-mcp', 'version': version, 'tool_count': 58})):
+                          ('package-metadata.json', {'name': 'unified-personal-mcp', 'version': version, 'tool_count': 63})):
         (destination / name).write_text(json.dumps(content, indent=2) + '\n', encoding='utf-8')
     rows = write_manifest(destination)
     validate_manifest(destination)

@@ -194,7 +194,7 @@ def register_bf_tools(
 
     @mcp.tool(
         name="WindowScreenshot",
-        description="Capture one bound window surface in the background. Minimized windows may be staged off-screen and restored.",
+        description="Capture one bound window surface in the background. Minimized windows may be staged off-screen and restored. prefer_coordinate_mapping=true requires an exact verified PrintWindow surface; ambiguous geometry is refused without falling back to WGC.",
         annotations=ToolAnnotations(
             title="Capture one window",
             readOnlyHint=True,
@@ -208,11 +208,13 @@ def register_bf_tools(
         window_id: str,
         include_frame: bool = False,
         allow_staging: bool = True,
+        prefer_coordinate_mapping: bool = False,
     ) -> ToolResult:
         del include_frame  # client-area/native surface policy is backend-defined
-        result = controller().screenshot(
-            bf_task_id, window_id, allow_staging=allow_staging
-        )
+        options = {"allow_staging": allow_staging}
+        if prefer_coordinate_mapping:
+            options["prefer_coordinate_mapping"] = True
+        result = controller().screenshot(bf_task_id, window_id, **options)
         return _window_result(result, result["window_capture"])
 
     @mcp.tool(

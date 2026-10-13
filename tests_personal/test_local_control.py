@@ -119,7 +119,7 @@ def test_control_key_is_private_stable_and_never_forwarded_to_tunnel(service):
         'params': {'name': 'server_info', 'arguments': {}}})
     assert key not in json.dumps(response)
     _, response = post(service, {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/list', 'params': {}})
-    assert len(response['result']['tools']) == 58
+    assert len(response['result']['tools']) == 63
     assert key not in json.dumps(response)
     assert service.tunnel.backend_key == service.runtime.auth_token
     assert key not in json.dumps(tunnel_environment('fixture-cloud-key', service.runtime.auth_token))

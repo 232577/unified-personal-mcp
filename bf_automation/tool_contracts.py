@@ -23,6 +23,7 @@ from .tool_schemas import (
     input_schema_for,
     output_schema_for,
 )
+from .window_control import CaptureGeometryUnavailable
 
 ACTION_TOOLS = {"App", "Click", "Clipboard", "Move", "Notification", "Scroll", "Shortcut", "Type"}
 
@@ -133,12 +134,16 @@ def _governed_tool(parent, *, browser_transfers_enabled=False):
             return _error("INVALID_ARGUMENT", str(exc), retry_safe=True)
         try:
             raw = await forward(**arguments)
+        except CaptureGeometryUnavailable:
+            return _error("COORDINATE_MAPPING_UNAVAILABLE", "The captured window surface has no verified coordinate mapping. Refresh with prefer_coordinate_mapping=true; do not guess pixel coordinates.", retry_safe=True)
+        except NotImplementedError:
+            return _error("UNSUPPORTED_OPERATION", f"{name}: the requested operation cannot be verified by this provider.")
         except PermissionError:
             return _error("ACCESS_DENIED", "Task/window ownership was refused. Inspect the task context; do not borrow another task's IDs.")
         except (ValueError, KeyError):
             return _error("INVALID_ARGUMENT", f"{name}: invalid arguments or unknown application. Recheck the profile and input contract; do not blindly retry.")
         except LookupError:
-            return _error("STALE_TARGET", "The window or element is stale. Refresh WindowInventory/WindowSnapshot before any action.")
+            return _error("STALE_TARGET", "The target is stale. Refresh Snapshot for desktop labels, or WindowInventory/WindowSnapshot for window targets, before any action.")
         except TimeoutError:
             return _error("TIMEOUT", f"{name}: timed out. Observe current state before retrying; a dispatched action may already have run.")
         except Exception as exc:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import ctypes
 import hashlib
 import io
@@ -24,6 +25,10 @@ def _uia_thread(method):
 
 class BackgroundControlUnavailable(RuntimeError):
     """Raised when an action cannot be completed without foreground input."""
+
+
+class CaptureGeometryUnavailable(RuntimeError):
+    """窗口画面缺少经过核验的像素映射，不能据此发送坐标输入。"""
 
 
 class WindowController:
@@ -66,19 +71,35 @@ class WindowController:
 
     def _window(self, token: str, window_id: str) -> dict:
         record = self.store.resolve_window(token, window_id)
-        if not self.win_api.validate_window(record["hwnd"], record["pid"]):
-            raise LookupError("window_id is stale")
+        self._validate_window(record)
         return record
 
-    def screenshot(self, token: str, window_id: str, *, allow_staging: bool = True) -> dict:
+    def _validate_window(self, record):
+        if not self.win_api.validate_window(record["hwnd"], record["pid"]):
+            raise LookupError("window_id is stale")
+
+    def screenshot(self, token: str, window_id: str, *, allow_staging: bool = True,
+                   prefer_coordinate_mapping: bool = False) -> dict:
         record = self._window(token, window_id)
         with self._operation_lock(record):
-            if getattr(self.win_api, "is_minimized", lambda hwnd: False)(record["hwnd"]):
-                self.store.claim_window(token, window_id)
-                with self.desktop_lease.hold(token):
-                    capture = self.capture_backend.capture(record["hwnd"], allow_staging=allow_staging)
-            else:
-                capture = self.capture_backend.capture(record["hwnd"], allow_staging=allow_staging)
+            self._validate_window(record)
+            return self._screenshot_locked(token, window_id, record, allow_staging=allow_staging,
+                                           prefer_coordinate_mapping=prefer_coordinate_mapping)
+
+    def _screenshot_locked(self, token, window_id, record, *, allow_staging,
+                           prefer_coordinate_mapping=False):
+        self._validate_window(record)
+        options = {"allow_staging": allow_staging}
+        if prefer_coordinate_mapping:
+            options["prefer_coordinate_mapping"] = True
+        if getattr(self.win_api, "is_minimized", lambda hwnd: False)(record["hwnd"]):
+            self.store.claim_window(token, window_id)
+            with self.desktop_lease.hold(token):
+                self._validate_window(record)
+                capture = self.capture_backend.capture(record["hwnd"], **options)
+        else:
+            capture = self.capture_backend.capture(record["hwnd"], **options)
+        self._validate_window(record)
         capture = dict(capture)
         png_bytes = capture.pop("png_bytes", None)
         if png_bytes is not None:
@@ -107,7 +128,13 @@ class WindowController:
             raise ValueError("max_elements must be between 1 and 200")
         record = self._window(token, window_id)
         with self._operation_lock(record):
+            self._validate_window(record)
             snapshot = dict(self.win_api.snapshot(record["hwnd"], max_elements=max_elements))
+            self._validate_window(record)
+            if include_image:
+                snapshot["capture"] = self._screenshot_locked(
+                    token, window_id, record, allow_staging=allow_staging
+                )["window_capture"]
         snapshot.update(
             {
                 "window_id": window_id,
@@ -115,10 +142,6 @@ class WindowController:
                 "title": record["title"],
             }
         )
-        if include_image:
-            snapshot["capture"] = self.screenshot(
-                token, window_id, allow_staging=allow_staging
-            )["window_capture"]
         return {"window_snapshot": snapshot}
 
     def control(
@@ -149,6 +172,7 @@ class WindowController:
         if shortcut is not None or action == "shortcut":
             kwargs["shortcut"] = shortcut
         with self._operation_lock(record):
+            self._validate_window(record)
             self.store.claim_window(token, window_id)
             return self._dispatch_control(token, window_id, record, kwargs, allow_foreground_fallback)
 
@@ -167,6 +191,7 @@ class WindowController:
                     "foreground_fallback_allowed": False,
                 }
             with self.desktop_lease.hold(token):
+                self._validate_window(record)
                 result = self.win_api.foreground_control(record["hwnd"], **kwargs)
         result = dict(result)
         result.update(
@@ -519,6 +544,15 @@ class NativeWinApi:
         hwnd = int(hwnd)
         control = self._element(hwnd, element)
 
+        if action == "click":
+            if button not in {"left", "right", "middle"} or type(clicks) is not int or clicks not in {1, 2}:
+                raise ValueError("invalid mouse variant")
+            if control is not None and (button != "left" or clicks != 1):
+                # 语义执行只表示单次左键激活，不能替代右键或双击。
+                if loc is None:
+                    raise BackgroundControlUnavailable("mouse variant requires explicit client coordinates")
+                control = None
+
         if control is not None:
             native_result = self._standard_background_action(hwnd, control, action, text, clear)
             if native_result is not None:
@@ -619,10 +653,19 @@ class NativeWinApi:
                 "right": self.win32con.MK_RBUTTON,
                 "middle": self.win32con.MK_MBUTTON,
             }[button]
+            double_message = None
+            if clicks == 2:
+                double_message = {
+                    "left": self.win32con.WM_LBUTTONDBLCLK,
+                    "right": self.win32con.WM_RBUTTONDBLCLK,
+                    "middle": self.win32con.WM_MBUTTONDBLCLK,
+                }[button]
             lparam = (y << 16) | (x & 0xFFFF)
             self.win32gui.PostMessage(target, self.win32con.WM_MOUSEMOVE, 0, lparam)
-            for _ in range(int(clicks)):
-                self.win32gui.PostMessage(target, message_down, flag, lparam)
+            self.win32gui.PostMessage(target, message_down, flag, lparam)
+            self.win32gui.PostMessage(target, message_up, 0, lparam)
+            if double_message is not None:
+                self.win32gui.PostMessage(target, double_message, flag, lparam)
                 self.win32gui.PostMessage(target, message_up, 0, lparam)
             return {"accepted": True, "mode": "win32_message", "verified": False}
 
@@ -652,14 +695,21 @@ class NativeWinApi:
             if element is not None:
                 try:
                     element.SetFocus()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    raise BackgroundControlUnavailable("target element could not acquire focus") from exc
             if self.win32gui.GetForegroundWindow() != hwnd:
                 raise BackgroundControlUnavailable("foreground focus changed before input dispatch")
+
+            def require_focus():
+                if self.win32gui.GetForegroundWindow() != hwnd:
+                    # 已分发输入可能生效，不能将此错误当成安全重试信号。
+                    raise RuntimeError("foreground focus changed; input outcome unknown")
+
             if action in {"invoke", "click"}:
                 button, clicks = kwargs.get("button", "left"), kwargs.get("clicks", 1)
                 if button not in {"left", "right", "middle"} or type(clicks) is not int or not 1 <= clicks <= 3:
                     raise ValueError("invalid mouse variant")
+                require_focus()
                 if (element is not None and button == "left" and clicks == 1
                         and self._pattern_call(element, "GetInvokePattern", "Invoke")):
                     pass
@@ -671,17 +721,23 @@ class NativeWinApi:
                     mouse = {"left": self.uia.Click, "right": self.uia.RightClick,
                              "middle": self.uia.MiddleClick}[button]
                     for _ in range(clicks):
+                        require_focus()
                         mouse(*point, waitTime=0.05)
                 else:
                     raise BackgroundControlUnavailable("foreground click requires element or loc")
             elif action in {"type", "set_value"}:
                 text = kwargs.get("text") or ""
                 if kwargs.get("clear"):
-                    self.uia.SendKeys("{Ctrl}a{Back}")
+                    require_focus()
+                    self.uia.SendKeys("{Ctrl}a")
+                    require_focus()
+                    self.uia.SendKeys("{Back}")
                 encoded = text.encode("utf-16-le")
                 for offset in range(0, len(encoded), 2):
                     char = chr(int.from_bytes(encoded[offset:offset + 2], "little"))
-                    if self.uia.SendUnicodeChar(char) != 2:
+                    require_focus()
+                    from .native_input import send_unicode_char
+                    if send_unicode_char(self.uia, char) != 2:
                         raise RuntimeError("text input outcome unknown")
             elif action == "shortcut":
                 shortcut = kwargs.get("shortcut")
@@ -704,6 +760,7 @@ class NativeWinApi:
                         sendkeys += key
                     else:
                         sendkeys += "{" + aliases.get(key.casefold(), key) + "}"
+                require_focus()
                 self.uia.SendKeys(sendkeys, interval=0.01)
             else:
                 raise BackgroundControlUnavailable(f"foreground fallback not implemented for {action}")
@@ -746,6 +803,54 @@ class WindowCaptureBackend:
         self.win32process = win32process
         self.win32ui = win32ui
         self.WindowsCapture = WindowsCapture
+
+    @staticmethod
+    def _physical_coordinates():
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            context = user32.GetThreadDpiAwarenessContext
+            context.restype = ctypes.c_void_p
+            awareness = user32.GetAwarenessFromDpiAwarenessContext
+            awareness.argtypes = [ctypes.c_void_p]
+            awareness.restype = ctypes.c_int
+            return awareness(context()) == 2
+        except (AttributeError, OSError):
+            return False
+
+    def _window_geometry(self, hwnd):
+        try:
+            client = self.win32gui.GetClientRect(int(hwnd))
+            return {
+                "window_rect": list(self.win32gui.GetWindowRect(int(hwnd))),
+                "client_origin": list(self.win32gui.ClientToScreen(int(hwnd), (0, 0))),
+                "client_size": [client[2] - client[0], client[3] - client[1]],
+                "minimized": bool(self.win32gui.IsIconic(int(hwnd))),
+                "physical_coordinates": self._physical_coordinates(),
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def _capture_geometry(capture, before, after):
+        result = dict(capture)
+        surface_rect = result.pop("capture_rect", None)
+        physical = bool(after and after.get("physical_coordinates") and not after.get("minimized"))
+        rect = before.get("window_rect") if before else None
+        stable = bool(before and after and before == after)
+        verified = bool(
+            physical and stable and result.get("capture_mode") == "print_window"
+            and rect is not None and surface_rect == rect
+            and result["width"] == rect[2] - rect[0]
+            and result["height"] == rect[3] - rect[1]
+        )
+        result.update(
+            capture_rect=list(rect) if verified else None,
+            client_origin=after["client_origin"] if physical else None,
+            client_size=after["client_size"] if physical else None,
+            source_width=result["width"], source_height=result["height"],
+            coordinate_space="window_surface_pixels", geometry_verified=verified,
+        )
+        return result
 
     def _restore_foreground(self, desired_hwnd: int) -> bool:
         if not desired_hwnd or not self.win32gui.IsWindow(desired_hwnd):
@@ -828,21 +933,46 @@ class WindowCaptureBackend:
             "staging_used": False,
         }
 
+    @staticmethod
+    def _native_print_window(hwnd, hdc):
+        from ctypes import wintypes
+
+        function = ctypes.WinDLL("user32", use_last_error=True).PrintWindow
+        function.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+        function.restype = wintypes.BOOL
+        return int(function(int(hwnd), int(hdc), 2))
+
+    def _delete_bitmap(self, bitmap):
+        try:
+            handle = bitmap.GetHandle()
+        except Exception:
+            return
+        if handle:
+            self.win32gui.DeleteObject(handle)
+
     def _print_window(self, hwnd: int) -> dict:
         left, top, right, bottom = self.win32gui.GetWindowRect(int(hwnd))
         width = max(1, right - left)
         height = max(1, bottom - top)
         window_dc = self.win32gui.GetWindowDC(int(hwnd))
-        source_dc = self.win32ui.CreateDCFromHandle(window_dc)
-        memory_dc = source_dc.CreateCompatibleDC()
-        bitmap = self.win32ui.CreateBitmap()
-        bitmap.CreateCompatibleBitmap(source_dc, width, height)
-        memory_dc.SelectObject(bitmap)
-        try:
-            result = int(ctypes.windll.user32.PrintWindow(int(hwnd), memory_dc.GetSafeHdc(), 2))
+        if not window_dc:
+            raise RuntimeError("GetWindowDC returned failure")
+        with ExitStack() as resources:
+            resources.callback(self.win32gui.ReleaseDC, int(hwnd), window_dc)
+            source_dc = self.win32ui.CreateDCFromHandle(window_dc)
+            resources.callback(source_dc.DeleteDC)
+            memory_dc = source_dc.CreateCompatibleDC()
+            resources.callback(memory_dc.DeleteDC)
+            bitmap = self.win32ui.CreateBitmap()
+            resources.callback(self._delete_bitmap, bitmap)
+            bitmap.CreateCompatibleBitmap(source_dc, width, height)
+            previous_bitmap = memory_dc.SelectObject(bitmap)
+            resources.callback(memory_dc.SelectObject, previous_bitmap)
+            result = self._native_print_window(hwnd, memory_dc.GetSafeHdc())
             if result != 1:
                 raise RuntimeError("PrintWindow returned failure")
             info = bitmap.GetInfo()
+            width, height = int(info["bmWidth"]), int(info["bmHeight"])
             bits = bitmap.GetBitmapBits(True)
             from PIL import Image
 
@@ -862,14 +992,10 @@ class WindowCaptureBackend:
                 "capture_mode": "print_window",
                 "width": width,
                 "height": height,
+                "capture_rect": [left, top, right, bottom],
                 "png_bytes": buffer.getvalue(),
                 "staging_used": False,
             }
-        finally:
-            self.win32gui.DeleteObject(bitmap.GetHandle())
-            memory_dc.DeleteDC()
-            source_dc.DeleteDC()
-            self.win32gui.ReleaseDC(int(hwnd), window_dc)
 
     def _stage_minimized(self, hwnd: int) -> dict:
         placement = self.win32gui.GetWindowPlacement(int(hwnd))
@@ -900,21 +1026,34 @@ class WindowCaptureBackend:
             finally:
                 self._restore_foreground(foreground)
 
-    def capture(self, hwnd, *, allow_staging=True):
+    def capture(self, hwnd, *, allow_staging=True, prefer_coordinate_mapping=False):
         hwnd = int(hwnd)
+        before = self._window_geometry(hwnd)
+        if prefer_coordinate_mapping:
+            if self.win32gui.IsIconic(hwnd):
+                raise CaptureGeometryUnavailable("COORDINATE_MAPPING_UNAVAILABLE: minimized window")
+            try:
+                result = self._print_window(hwnd)
+                result = self._capture_geometry(result, before, self._window_geometry(hwnd))
+            except Exception as exc:
+                raise CaptureGeometryUnavailable("COORDINATE_MAPPING_UNAVAILABLE: PrintWindow failed") from exc
+            if not result["geometry_verified"]:
+                raise CaptureGeometryUnavailable("COORDINATE_MAPPING_UNAVAILABLE: unverified window geometry")
+            return result
         if self.win32gui.IsIconic(hwnd):
             if not allow_staging:
                 raise RuntimeError("minimized capture requires staging")
-            return self._stage_minimized(hwnd)
+            result = self._stage_minimized(hwnd)
+            return self._capture_geometry(result, before, self._window_geometry(hwnd))
         failures = []
         try:
-            return self._wgc(hwnd)
+            result = self._wgc(hwnd)
         except Exception as exc:
             failures.append(f"wgc_d3d11:{type(exc).__name__}:{exc}")
-        try:
-            result = self._print_window(hwnd)
-            result["fallback_chain"] = failures + ["print_window:ok"]
-            return result
-        except Exception as exc:
-            failures.append(f"print_window:{type(exc).__name__}:{exc}")
-        raise RuntimeError("window capture failed; " + " | ".join(failures))
+            try:
+                result = self._print_window(hwnd)
+                result["fallback_chain"] = failures + ["print_window:ok"]
+            except Exception as exc:
+                failures.append(f"print_window:{type(exc).__name__}:{exc}")
+                raise RuntimeError("window capture failed; " + " | ".join(failures)) from exc
+        return self._capture_geometry(result, before, self._window_geometry(hwnd))
